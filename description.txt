@@ -1,0 +1,25 @@
+Local "Context Pruning" Middleware for Edge Devices
+
+The Problem: Running massive 32k or 128k context windows locally on consumer laptops (like Ubuntu rigs with mid-range GPUs) causes massive slowdowns and memory crashes.
+
+The Missing Project: A lightweight proxy middleware layer that sits directly between your local app and Ollama. It doesn't just pass text; it acts as a dynamic "semantic compressor." It aggressively ranks text relevance, cuts out conversational filler on the fly, and optimizes vector chunks before feeding them to your RAM-constrained local GPU.
+
+Why the Community Wants It: It would instantly make local open-source models feel snappy, fast, and lightweight on normal consumer computers without requiring expensive upgrades.
+
+Proposed Solution: A RAG system that will keep the entire context window temporarily in local storage. We will intelligently prune it down to the most relevant pieces before sending it to the GPU for inference. This way, we can maintain a large historical context without overwhelming the local hardware.
+
+Step 1: 
+Coarse-Grained RAG (The Retrieval)Instead of feeding the entire terminal command log, chat history, or file systems directly to your LLM, a local, super-fast vector database like Chroma or Milvus stores historical context on the SSD.
+
+The Query: When a new system task is triggered, a highly lightweight embedding model (like all-minilm-l6-v2, requiring less than 50MB of VRAM) fetches the top-20 most relevant blocks of history.
+
+Step 2: 
+Fine-Grained Semantic Pruning (The Trimming)This is where the RAG-assisted middleware shines. Passing all 20 blocks will cause local token latency to spike. The middleware processes the raw extracted text chunks on the CPU before it hits the GPU, applying three specific pruning strategies:
+-> Redundancy Elimination: It strips out duplicate bash syntax, repetitive chat greetings ("Hello, how can I help you today?"), and duplicate code blocks.
+-> Attention-Based Attention Trimming: It utilizes a fast Cross-Encoder model to score individual sentences within the retrieved blocks. Anything scoring under a 75% relevance threshold is cleanly erased from the text.
+-> Lossless Token Compression: It shortens syntax by translating verbosity into concise key-value mappings that edge-grade LLMs interpret natively without losing intent.
+
+What we use:
+LLM Ollama Model: phi4-mini:3.8b Q4_K_M
+Text Embedding Model: nomic-embed-text:v1.5
+Vector Database: ChromaDB (local SSD storage)
