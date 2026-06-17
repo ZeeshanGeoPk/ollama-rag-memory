@@ -4,9 +4,10 @@ from contextlib import asynccontextmanager
 import asyncio
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
 
 from .bootstrap import OllamaBootstrapError, OllamaServerManager, ensure_model
 from .config import Settings
@@ -20,6 +21,59 @@ class AppState:
     manager: OllamaServerManager | None
     pipeline: ContextPipeline
     http_client: httpx.AsyncClient
+
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., examples=["user"])
+    content: str = Field(..., examples=["What is my project about?"])
+
+
+class OllamaChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = Field(default=None, examples=["phi4-mini:3.8b"])
+    messages: list[ChatMessage] = Field(
+        default_factory=list,
+        examples=[[{"role": "user", "content": "Remember that this project prunes local Ollama context."}]],
+    )
+    stream: bool = Field(default=False, examples=[False])
+    conversation_id: str | None = Field(
+        default=None,
+        description="Stable middleware conversation id for context storage and retrieval.",
+        examples=["my-chat-1"],
+    )
+    options: dict[str, Any] | None = Field(
+        default=None,
+        description="Ollama options. You may also include conversation_id here.",
+        examples=[{"temperature": 0.2}],
+    )
+
+
+class OllamaGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = Field(default=None, examples=["phi4-mini:3.8b"])
+    prompt: str = Field(default="", examples=["Summarize what this project does."])
+    stream: bool = Field(default=False, examples=[False])
+    conversation_id: str | None = Field(default=None, examples=["my-chat-1"])
+    options: dict[str, Any] | None = Field(default=None, examples=[{"temperature": 0.2}])
+
+
+class OllamaEmbedRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = Field(default=None, examples=["nomic-embed-text:v1.5"])
+    input: str | list[str] = Field(
+        ...,
+        examples=["Context pruning middleware for local Ollama models."],
+    )
+
+
+class OllamaEmbeddingsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = Field(default=None, examples=["nomic-embed-text:v1.5"])
+    prompt: str = Field(..., examples=["Context pruning middleware for local Ollama models."])
 
 
 @asynccontextmanager
@@ -84,8 +138,8 @@ async def tags() -> JSONResponse:
 
 
 @app.post("/api/chat")
-async def chat(request: Request) -> Any:
-    payload = await request.json()
+async def chat(request: OllamaChatRequest) -> Any:
+    payload = _payload(request)
     state: AppState = app.state.middle_layer
     payload.setdefault("model", state.settings.llm_model)
     conversation_id = conversation_id_from_payload(
@@ -104,8 +158,8 @@ async def chat(request: Request) -> Any:
 
 
 @app.post("/api/generate")
-async def generate(request: Request) -> Any:
-    payload = await request.json()
+async def generate(request: OllamaGenerateRequest) -> Any:
+    payload = _payload(request)
     state: AppState = app.state.middle_layer
     payload.setdefault("model", state.settings.llm_model)
     conversation_id = conversation_id_from_payload(
@@ -124,16 +178,16 @@ async def generate(request: Request) -> Any:
 
 
 @app.post("/api/embed")
-async def embed(request: Request) -> Any:
-    payload = await request.json()
+async def embed(request: OllamaEmbedRequest) -> Any:
+    payload = _payload(request)
     state: AppState = app.state.middle_layer
     payload.setdefault("model", state.settings.embed_model)
     return await _forward_embedding("/api/embed", payload)
 
 
 @app.post("/api/embeddings")
-async def embeddings(request: Request) -> Any:
-    payload = await request.json()
+async def embeddings(request: OllamaEmbeddingsRequest) -> Any:
+    payload = _payload(request)
     state: AppState = app.state.middle_layer
     payload.setdefault("model", state.settings.embed_model)
     return await _forward_embedding("/api/embeddings", payload)
@@ -194,3 +248,7 @@ async def _stream_ollama(url: str, payload: dict[str, Any]):
     async with state.http_client.stream("POST", url, json=payload) as response:
         async for chunk in response.aiter_bytes():
             yield chunk
+
+
+def _payload(model: BaseModel) -> dict[str, Any]:
+    return model.model_dump(exclude_none=True)
