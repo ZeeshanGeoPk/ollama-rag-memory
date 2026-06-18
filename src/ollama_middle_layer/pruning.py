@@ -5,6 +5,10 @@ import math
 import re
 
 
+# ---------------------------------------------------------------------------
+# Lightweight text classification
+# ---------------------------------------------------------------------------
+
 FILLER_PATTERNS = [
     re.compile(r"^\s*(hello|hi|hey)[!. ]*$", re.IGNORECASE),
     re.compile(r"^\s*how can i help you( today)?[?.! ]*$", re.IGNORECASE),
@@ -21,6 +25,7 @@ GLOBAL_HISTORY_PATTERNS = [
 
 
 def estimate_tokens(text: str) -> int:
+    """Fast, tokenizer-free approximation used only for context budgeting."""
     return max(1, math.ceil(len(text) / 4))
 
 
@@ -30,15 +35,18 @@ def split_sentences(text: str) -> list[str]:
 
 
 def chunk_text(text: str, max_chars: int = 1400, overlap: int = 160) -> list[str]:
+    """Split text into embedding-sized chunks while retaining local continuity."""
     cleaned = text.strip()
     if not cleaned:
         return []
     if len(cleaned) <= max_chars:
         return [cleaned]
 
+    # Prefer paragraph and sentence boundaries. Oversized units are handled by
+    # `_hard_split`, so code or unpunctuated logs cannot exceed the target size.
     units = re.split(r"(?<=\n)\s*\n+|(?<=[.!?])\s+(?=[A-Z0-9*`])", cleaned)
     chunks: list[str] = []
-    current = ""
+    current = ""  # Candidate chunk currently being filled.
     for unit in units:
         unit = unit.strip()
         if not unit:
@@ -54,7 +62,7 @@ def chunk_text(text: str, max_chars: int = 1400, overlap: int = 160) -> list[str
             current = candidate
             continue
         chunks.append(current)
-        tail = current[-overlap:].strip() if overlap > 0 else ""
+        tail = current[-overlap:].strip() if overlap > 0 else ""  # Context bridge.
         current = f"{tail}\n{unit}".strip() if tail else unit
     if current:
         chunks.append(current)
@@ -96,6 +104,7 @@ def relevance_score(
     query_embedding: list[float],
     sentence_embedding: list[float],
 ) -> float:
+    """Blend semantic similarity with a small exact-term relevance signal."""
     semantic = (cosine_similarity(query_embedding, sentence_embedding) + 1.0) / 2.0
     query_terms = _meaningful_terms(query)
     sentence_terms = _meaningful_terms(sentence)
@@ -110,8 +119,8 @@ def relevance_score(
 def compact_context(text: str) -> str:
     """Compact formatting while preserving words, code, and ordering."""
     compacted: list[str] = []
-    blank_pending = False
-    in_code = False
+    blank_pending = False  # Defers one blank line until meaningful text follows.
+    in_code = False  # Prevents whitespace normalization inside fenced code.
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
         if line.strip().startswith("```"):
@@ -133,6 +142,10 @@ def compact_context(text: str) -> str:
             compacted.append(normalized)
     return "\n".join(compacted).strip()
 
+
+# ---------------------------------------------------------------------------
+# Similarity and duplicate detection
+# ---------------------------------------------------------------------------
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:
     if not left or not right or len(left) != len(right):
@@ -173,8 +186,9 @@ def limit_items_by_budget(
     max_tokens: int,
     separator: str = "\n",
 ) -> list[str]:
+    """Keep complete items that fit, skipping oversized items when necessary."""
     kept: list[str] = []
-    used = 0
+    used = 0  # Approximate tokens already reserved by accepted items.
     for item in items:
         cost = estimate_tokens(item)
         if used + cost > max_tokens:
@@ -185,12 +199,13 @@ def limit_items_by_budget(
 
 
 def prune_by_budget(sections: list[str], max_tokens: int) -> list[str]:
+    """Keep sections in priority order and truncate only the final overflow."""
     kept: list[str] = []
-    used = 0
+    used = 0  # Sections are ordered from highest to lowest priority.
     for section in sections:
         cost = estimate_tokens(section)
         if used + cost > max_tokens:
-            remaining = max_tokens - used
+            remaining = max_tokens - used  # Approximate tokens left for this section.
             if remaining > 20:
                 kept.append(section[: remaining * 4].rstrip())
             break
@@ -201,7 +216,7 @@ def prune_by_budget(sections: list[str], max_tokens: int) -> list[str]:
 
 def _hard_split(text: str, max_chars: int, overlap: int) -> list[str]:
     chunks: list[str] = []
-    start = 0
+    start = 0  # Character offset of the next hard-split window.
     while start < len(text):
         end = min(len(text), start + max_chars)
         if end < len(text):

@@ -9,6 +9,7 @@ from .config import Settings
 
 
 def main() -> None:
+    """Validate local prerequisites and launch the FastAPI application."""
     settings = Settings.load()
     if settings.ollama_bootstrap and shutil.which("ollama") is None:
         print(

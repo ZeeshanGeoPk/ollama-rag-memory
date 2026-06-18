@@ -1,10 +1,14 @@
+// ---------------------------------------------------------------------------
+// Client state and DOM references
+// ---------------------------------------------------------------------------
+
 const state = {
-  conversations: [],
-  conversationId: null,
-  mode: "middleware",
-  generating: false,
-  controller: null,
-  context: null,
+  conversations: [], // Sidebar summaries returned by the server.
+  conversationId: null, // Null means the next message creates a conversation.
+  mode: "middleware", // Either RAG-assisted middleware or full-history Ollama.
+  generating: false, // Also changes the send button into a stop button.
+  controller: null, // AbortController for the active streaming request.
+  context: null, // Last forwarded-context snapshot displayed in the inspector.
 };
 
 const elements = {
@@ -60,6 +64,10 @@ elements.input.addEventListener("keydown", (event) => {
 });
 
 initialize();
+
+// ---------------------------------------------------------------------------
+// Conversation lifecycle
+// ---------------------------------------------------------------------------
 
 async function initialize() {
   await loadConversations();
@@ -196,11 +204,15 @@ async function sendMessage() {
     if (!response.ok) {
       throw new Error(await response.text());
     }
+    // The server sends context metadata first, incremental tokens next, and a
+    // final metrics event. This keeps the context panel useful during streaming.
     await readNdjson(response, (event) => {
       if (event.type === "meta") {
         state.conversationId = event.conversation_id;
         renderContext(event.context);
       } else if (event.type === "token") {
+        // Preserve manual scroll position; auto-follow only if the user was
+        // already reading near the bottom before this token arrived.
         const shouldFollow = isNearMessageBottom();
         assistant.content.textContent += event.content;
         if (shouldFollow) scrollToBottom();
@@ -277,6 +289,10 @@ function removeEmptyState() {
   document.querySelector("#empty-state")?.remove();
 }
 
+// ---------------------------------------------------------------------------
+// Mode and forwarded-context inspector
+// ---------------------------------------------------------------------------
+
 function setMode(mode) {
   state.mode = mode;
   document.querySelectorAll(".mode-option").forEach((button) => {
@@ -335,6 +351,10 @@ async function pollGpu() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// GPU telemetry
+// ---------------------------------------------------------------------------
+
 function renderGpu(stats) {
   elements.gpuCompact.classList.toggle("available", stats.available);
   if (!stats.available || !stats.gpus.length) {
@@ -347,7 +367,7 @@ function renderGpu(stats) {
     return;
   }
 
-  const gpu = stats.gpus[0];
+  const gpu = stats.gpus[0]; // Compact UI currently presents the primary GPU.
   elements.gpuCompactText.textContent = `${Math.round(gpu.utilization_percent || 0)}% GPU`;
   elements.gpuDetails.replaceChildren();
 
@@ -395,6 +415,10 @@ function meter(label, percent, value, className) {
   return root;
 }
 
+// ---------------------------------------------------------------------------
+// UI state and responsive panels
+// ---------------------------------------------------------------------------
+
 function setGenerating(generating) {
   state.generating = generating;
   elements.sendButton.classList.toggle("stop", generating);
@@ -417,7 +441,7 @@ function scrollToBottom() {
 }
 
 function isNearMessageBottom() {
-  const distance =
+  const distance = // Remaining scrollable pixels below the viewport.
     elements.messageArea.scrollHeight -
     elements.messageArea.scrollTop -
     elements.messageArea.clientHeight;
@@ -444,10 +468,12 @@ async function api(url, options = {}) {
   return response.json();
 }
 
+// Fetch streams are arbitrary byte chunks, not guaranteed line boundaries.
+// Keep an incomplete NDJSON line buffered until the next network chunk arrives.
 async function readNdjson(response, onEvent) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = "";
+  let buffer = ""; // Incomplete trailing NDJSON line from the previous read.
   while (true) {
     const { value, done } = await reader.read();
     buffer += decoder.decode(value || new Uint8Array(), { stream: !done });

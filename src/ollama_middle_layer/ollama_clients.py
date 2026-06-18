@@ -22,6 +22,8 @@ def create_ollama_clients(llm_host: str, embed_host: str) -> OllamaClients:
 
 
 class EmbeddingService:
+    """Apply retrieval prefixes and normalize Ollama embedding responses."""
+
     def __init__(self, client: Any, model: str) -> None:
         self.client = client
         self.model = model
@@ -30,6 +32,7 @@ class EmbeddingService:
         return self._embed_one(text)
 
     def embed_query(self, text: str) -> list[float]:
+        # nomic-embed-text uses asymmetric prefixes for retrieval tasks.
         return self._embed_one(f"search_query: {text}")
 
     def embed_document(self, text: str) -> list[float]:
@@ -40,12 +43,14 @@ class EmbeddingService:
 
     def _embed_one(self, text: str) -> list[float]:
         response = self.client.embed(model=self.model, input=text)
+        # Current Ollama responses use a list even when only one input was sent.
         embeddings = getattr(response, "embeddings", None)
         if embeddings is None and isinstance(response, dict):
             embeddings = response.get("embeddings")
         if embeddings:
             return list(embeddings[0])
 
+        # Older Ollama SDK/API versions returned a singular `embedding` field.
         legacy = getattr(response, "embedding", None)
         if legacy is None and isinstance(response, dict):
             legacy = response.get("embedding")
@@ -65,4 +70,5 @@ class EmbeddingService:
             embeddings = response.get("embeddings")
         if embeddings:
             return [list(item) for item in embeddings]
+        # Fall back to individual requests for servers without batch embedding.
         return [self._embed_one(text) for text in texts]

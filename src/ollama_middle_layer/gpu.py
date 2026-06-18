@@ -5,6 +5,7 @@ import subprocess
 
 
 def read_gpu_stats() -> dict:
+    """Return best-effort NVIDIA telemetry without making GPU support mandatory."""
     binary = shutil.which("nvidia-smi")
     if binary is None:
         return {
@@ -14,6 +15,7 @@ def read_gpu_stats() -> dict:
             "gpus": [],
         }
 
+    # nounits produces stable numeric fields that the frontend can format.
     query = (
         "name,utilization.gpu,memory.used,memory.total,"
         "temperature.gpu,power.draw"
@@ -38,9 +40,9 @@ def read_gpu_stats() -> dict:
             "gpus": [],
         }
 
-    gpus = []
+    gpus = []  # One normalized record per CSV row/GPU.
     for index, line in enumerate(result.stdout.splitlines()):
-        values = [value.strip() for value in line.split(",")]
+        values = [value.strip() for value in line.split(",")]  # Matches `query` order.
         if len(values) != 6:
             continue
         name, utilization, memory_used, memory_total, temperature, power = values

@@ -6,6 +6,7 @@ import os
 
 
 def _load_dotenv(path: Path) -> None:
+    """Load a minimal KEY=VALUE file without overriding exported variables."""
     if not path.exists():
         return
     for raw_line in path.read_text().splitlines():
@@ -27,6 +28,8 @@ def _bool_env(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
+    """Runtime configuration loaded from environment variables and `.env`."""
+
     middleware_host: str
     middleware_port: int
     llm_ollama_host: str
@@ -45,12 +48,13 @@ class Settings:
     recent_context_tokens: int
     retrieved_context_tokens: int
     max_recent_assistant_sentences: int
-    max_retrieved_sentences: int
     default_conversation_id: str
     ollama_bootstrap: bool
 
     @classmethod
     def load(cls, base_dir: Path | None = None) -> "Settings":
+        # Relative data paths are resolved from the launch directory (or the
+        # explicit base_dir used by tests and embedding applications).
         root = base_dir or Path.cwd()
         _load_dotenv(root / ".env")
         return cls(
@@ -78,7 +82,6 @@ class Settings:
             max_recent_assistant_sentences=int(
                 os.getenv("MAX_RECENT_ASSISTANT_SENTENCES", "4")
             ),
-            max_retrieved_sentences=int(os.getenv("MAX_RETRIEVED_SENTENCES", "8")),
             default_conversation_id=os.getenv("DEFAULT_CONVERSATION_ID", "default"),
             ollama_bootstrap=_bool_env("OLLAMA_BOOTSTRAP", True),
         )

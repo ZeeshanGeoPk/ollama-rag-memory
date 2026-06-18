@@ -8,6 +8,7 @@
 </head>
 <body>
   <div class="app-shell">
+    <!-- Saved conversation navigation -->
     <aside class="sidebar" id="sidebar">
       <div class="brand-row">
         <div class="brand-mark">LC</div>
@@ -26,6 +27,7 @@
       <nav class="conversation-list" id="conversation-list" aria-label="Conversation history"></nav>
     </aside>
 
+    <!-- Active transcript and prompt composer -->
     <main class="chat-workspace">
       <header class="topbar">
         <button class="icon-button mobile-only" id="sidebar-toggle" type="button" title="Open conversations" aria-label="Open conversations">☰</button>
@@ -66,6 +68,7 @@
       </footer>
     </main>
 
+    <!-- Shows the exact context sent to Ollama in the selected mode. -->
     <aside class="context-panel" id="context-panel">
       <div class="panel-header">
         <div>

@@ -18,6 +18,10 @@ from .pruning import (
 from .storage import ChromaContextStore, RetrievedChunk, TurnStore
 
 
+# ---------------------------------------------------------------------------
+# Public context result
+# ---------------------------------------------------------------------------
+
 @dataclass(frozen=True)
 class ContextPreview:
     conversation_id: str
@@ -31,6 +35,8 @@ class ContextPreview:
 
 
 class ContextPipeline:
+    """Coordinates durable history, vector retrieval, and forwarding budgets."""
+
     def __init__(
         self,
         settings: Settings,
@@ -44,6 +50,7 @@ class ContextPipeline:
         self.embedding_service = embedding_service
 
     def ingest_messages(self, conversation_id: str, messages: list[dict[str, Any]]) -> None:
+        """Persist full turns in SQLite and their chunk embeddings in Chroma."""
         for message in messages:
             role = str(message.get("role", "user"))
             content = str(message.get("content", "")).strip()
@@ -53,7 +60,8 @@ class ContextPipeline:
             self.chroma_store.add_turn(conversation_id, turn_id, role, content)
 
     def sync_history(self, conversation_id: str, messages: list[dict[str, Any]]) -> None:
-        stored = self.turn_store.all_turns(conversation_id)
+        """Append the portion of client-provided history not already persisted."""
+        stored = self.turn_store.all_turns(conversation_id)  # Authoritative indexed prefix.
         normalized = [
             {
                 "role": str(message.get("role", "user")),
@@ -62,7 +70,9 @@ class ContextPipeline:
             for message in messages
             if str(message.get("content", "")).strip()
         ]
-        common = 0
+        # API clients often resend the complete transcript on every request.
+        # Comparing the common prefix prevents re-embedding those same turns.
+        common = 0  # Number of leading turns already present in local storage.
         for existing, incoming in zip(stored, normalized):
             if existing.role != incoming["role"] or existing.content != incoming["content"]:
                 break
@@ -82,6 +92,7 @@ class ContextPipeline:
         current_text: str,
         current_is_stored: bool = False,
     ) -> ContextPreview:
+        """Build the exact context that would be forwarded for a request."""
         recent_turns = self.turn_store.recent_turns(
             conversation_id, self.settings.recent_turns_to_keep
         )
@@ -92,17 +103,21 @@ class ContextPipeline:
             and all_turns[-1].role == "user"
             and all_turns[-1].content == current_text
         ):
+            # The UI context endpoint runs after saving the latest prompt. Remove
+            # that prompt here so its preview matches the pre-generation context.
             current_turn_id = all_turns[-1].id
             all_turns = all_turns[:-1]
             recent_turns = [
                 turn for turn in recent_turns if turn.id != current_turn_id
             ]
-        recent_ids = {turn.id for turn in recent_turns}
+        recent_ids = {turn.id for turn in recent_turns}  # Excluded from vector memory.
         older_turns = [turn for turn in all_turns if turn.id not in recent_ids]
-        context_query = self._context_query(current_text, recent_turns)
+        context_query = self._context_query(current_text, recent_turns)  # Embedding input.
         global_history = is_global_history_query(current_text)
         if global_history:
-            raw_chunks = [turn.content for turn in older_turns]
+            # Questions about the entire chat must not use top-k semantic search;
+            # doing so would silently omit unrelated portions of the transcript.
+            raw_chunks = [turn.content for turn in older_turns]  # Debug/UI visibility.
             pruned_chunks = self._history_overview(older_turns)
         else:
             retrieved = self.chroma_store.query(
@@ -110,7 +125,7 @@ class ContextPipeline:
                 context_query,
                 self.settings.retrieval_top_k,
             )
-            raw_chunks = [
+            raw_chunks = [  # Raw Chroma hits shown in the context inspector.
                 chunk.text
                 for chunk in retrieved
                 if int(chunk.metadata.get("turn_id", -1)) not in recent_ids
@@ -119,6 +134,8 @@ class ContextPipeline:
                 retrieved,
                 older_turns,
             )
+        # Recent continuity and retrieved memory have separate budgets before the
+        # final cap is applied to their combined forwarded representation.
         context_sections = []
         recent: list[str] = []
         if recent_turns:
@@ -151,6 +168,7 @@ class ContextPipeline:
         if current_text:
             original_text = f"{original_text}\nuser: {current_text}".strip()
         original_tokens = estimate_tokens(original_text) if original_text else 0
+        # Forwarded count includes both generated memory and the active request.
         forwarded_tokens = estimate_tokens(
             f"{pruned_context}\nuser: {current_text}".strip()
         )
@@ -182,11 +200,13 @@ class ContextPipeline:
         if not retrieved or not older_turns:
             return []
 
-        turns_by_id = {turn.id: turn for turn in older_turns}
+        turns_by_id = {turn.id: turn for turn in older_turns}  # O(1) hit lookup.
         turn_positions = {turn.id: index for index, turn in enumerate(older_turns)}
+        # Key: ordered turn ids in one memory exchange. Value: hit rank/chunks.
         groups: dict[tuple[int, ...], dict[str, Any]] = {}
 
         for rank, hit in enumerate(retrieved):
+            # `rank` follows Chroma relevance order; lower values are preferred.
             try:
                 turn_id = int(hit.metadata.get("turn_id", -1))
                 chunk_index = int(hit.metadata.get("chunk_index", 0))
@@ -196,12 +216,16 @@ class ContextPipeline:
             if turn is None:
                 continue
 
+            # A vector hit is an anchor, not a complete memory. Pairing restores
+            # the question/answer exchange around that semantically matched text.
             group_turn_ids = [turn_id]
             if self.settings.retrieval_include_turn_pair:
                 pair_id = self._paired_turn_id(turn_id, older_turns, turn_positions)
                 if pair_id is not None:
                     group_turn_ids.append(pair_id)
             group_key = tuple(sorted(group_turn_ids, key=turn_positions.__getitem__))
+            # Multiple matching chunks from one exchange collapse into one
+            # passage while retaining the best Chroma rank for ordering.
             group = groups.setdefault(
                 group_key,
                 {
@@ -212,7 +236,7 @@ class ContextPipeline:
             group["rank"] = min(group["rank"], rank)
             group["chunk_indexes"].setdefault(turn_id, set()).add(chunk_index)
 
-        passages: list[tuple[int, str]] = []
+        passages: list[tuple[int, str]] = []  # (best retrieval rank, rendered text)
         for turn_ids, group in groups.items():
             lines = [
                 (
@@ -266,6 +290,8 @@ class ContextPipeline:
         if not chunks:
             return ""
         neighbor_count = self.settings.retrieval_chunk_neighbors
+        # Restore adjacent chunks because embeddings often match the conclusion
+        # while definitions, constraints, or code begin just before it.
         selected_indexes: set[int] = set()
         for index in matched_indexes:
             start = max(0, index - neighbor_count)
@@ -281,7 +307,9 @@ class ContextPipeline:
     def _prune_recent_turns(self, query: str, turns: list[Any]) -> list[str]:
         if not turns:
             return []
-        protected_start = len(turns) - 1
+        # Keep the latest user request verbatim. Other recent content can be
+        # sentence-ranked to preserve conversational continuity more cheaply.
+        protected_start = len(turns) - 1  # Index of the latest user-led exchange.
         for index in range(len(turns) - 1, -1, -1):
             if turns[index].role == "user":
                 protected_start = index
@@ -339,6 +367,7 @@ class ContextPipeline:
         ]
         if keep_fallback and not selected:
             selected = ranked
+        # Rank for selection, then restore source order for readable prose.
         selected = sorted(selected, key=lambda item: item[1], reverse=True)[:limit]
         return [
             item[2]
@@ -357,6 +386,8 @@ class ContextPipeline:
         )
         if not previous_user:
             return current_text
+        # Short follow-ups such as "implement it" become retrievable when paired
+        # with the preceding user request that supplies their missing subject.
         return f"{previous_user}\nFollow-up request: {current_text}"
 
     def _history_overview(self, turns: list[Any]) -> list[str]:
@@ -374,6 +405,7 @@ class ContextPipeline:
         return overview
 
     def augment_chat_payload(self, conversation_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Replace full chat history with system prompts, RAG memory, and the request."""
         messages = list(payload.get("messages") or [])
         current_text = _latest_user_text(messages)
         if not current_text:
@@ -408,6 +440,7 @@ class ContextPipeline:
         return augmented
 
     def fallback_chat_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Provide a bounded recent-history request when retrieval fails."""
         messages = list(payload.get("messages") or [])
         system_messages = [
             message for message in messages if message.get("role") == "system"
@@ -416,10 +449,11 @@ class ContextPipeline:
             message for message in messages if message.get("role") != "system"
         ]
         selected: list[dict[str, Any]] = []
-        used_tokens = sum(
+        used_tokens = sum(  # System prompts consume the same forwarding budget.
             estimate_tokens(str(message.get("content", "")))
             for message in system_messages
         )
+        # Walk backward because the newest turns carry the most immediate state.
         for message in reversed(conversational):
             content = str(message.get("content", ""))
             cost = estimate_tokens(content)
@@ -427,6 +461,7 @@ class ContextPipeline:
                 break
             if used_tokens + cost > self.settings.max_context_tokens:
                 remaining = max(1, self.settings.max_context_tokens - used_tokens)
+                # Keep the newest tail when a single old message exceeds the cap.
                 message = {**message, "content": content[-remaining * 4 :]}
                 cost = remaining
             selected.append(message)

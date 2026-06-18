@@ -31,7 +31,13 @@ from .storage import (
 WEB_DIR = Path(__file__).parent / "web"
 
 
+# ---------------------------------------------------------------------------
+# Application state and request models
+# ---------------------------------------------------------------------------
+
 class AppState:
+    """Services created once during startup and shared by all API handlers."""
+
     settings: Settings
     manager: OllamaServerManager | None
     pipeline: ContextPipeline
@@ -108,10 +114,13 @@ class UIChatRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Start local services, initialize persistence, and release owned resources."""
     settings = Settings.load()
     manager: OllamaServerManager | None = None
     clients = create_ollama_clients(settings.llm_ollama_host, settings.embed_ollama_host)
 
+    # Bootstrap is optional so tests or externally managed Ollama servers can use
+    # the middleware without this process owning their lifecycle.
     if settings.ollama_bootstrap:
         manager = OllamaServerManager(settings.ollama_models_dir)
         try:
@@ -128,6 +137,8 @@ async def lifespan(app: FastAPI):
     turn_store = TurnStore(settings.sqlite_path)
     conversation_store = ConversationStore(settings.sqlite_path)
     chroma_store = ChromaContextStore(settings.chroma_dir, embedding_service)
+    # SQLite is the source of truth. Rebuild Chroma only when its collection is
+    # empty, which covers a deleted vector directory without duplicating records.
     await asyncio.to_thread(chroma_store.reindex_if_empty, turn_store.every_turn())
     app.state.middle_layer = AppState()
     app.state.middle_layer.settings = settings
@@ -150,6 +161,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Ollama Context-Pruning Middleware", lifespan=lifespan)
 
+
+# ---------------------------------------------------------------------------
+# Ollama-compatible proxy API
+# ---------------------------------------------------------------------------
 
 @app.get("/", include_in_schema=False)
 async def web_ui() -> FileResponse:
@@ -186,6 +201,8 @@ async def chat(request: OllamaChatRequest) -> Any:
     original_messages = list(payload.get("messages") or [])
     try:
         if original_messages:
+            # Sync only prior history first. The current prompt must not be in the
+            # retrieval corpus while we are building context for that same prompt.
             prior_messages, current_message = _split_chat_history(original_messages)
             await asyncio.to_thread(
                 state.pipeline.sync_history,
@@ -243,6 +260,10 @@ async def embeddings(request: OllamaEmbeddingsRequest) -> Any:
     return await _forward_embedding("/api/embeddings", payload)
 
 
+# ---------------------------------------------------------------------------
+# Browser UI API
+# ---------------------------------------------------------------------------
+
 @app.get("/ui/api/conversations")
 async def list_conversations() -> list[dict[str, Any]]:
     state: AppState = app.state.middle_layer
@@ -296,6 +317,8 @@ async def delete_conversation(conversation_id: str) -> dict[str, bool]:
     try:
         await asyncio.to_thread(state.pipeline.delete_conversation, conversation_id)
     except Exception:
+        # The visible conversation should still be deletable if Chroma is
+        # temporarily unavailable; stale vectors are scoped by conversation id.
         pass
     return {"ok": True}
 
@@ -303,7 +326,7 @@ async def delete_conversation(conversation_id: str) -> dict[str, bool]:
 @app.post("/ui/api/chat")
 async def ui_chat(request: UIChatRequest) -> StreamingResponse:
     state: AppState = app.state.middle_layer
-    conversation = None
+    conversation = None  # Created lazily for the first message of a new chat.
     if request.conversation_id:
         conversation = await asyncio.to_thread(
             state.conversation_store.get, request.conversation_id
@@ -317,7 +340,7 @@ async def ui_chat(request: UIChatRequest) -> StreamingResponse:
 
     prior_messages = await asyncio.to_thread(
         state.conversation_store.messages, conversation.id
-    )
+    )  # UI-visible transcript; direct mode sends this entire list.
     if not prior_messages and conversation.title == "New chat":
         await asyncio.to_thread(
             state.conversation_store.set_title,
@@ -336,11 +359,14 @@ async def ui_chat(request: UIChatRequest) -> StreamingResponse:
     context_data: dict[str, Any]
     if request.mode == "middleware":
         try:
+            # Build context before indexing this prompt to avoid retrieving the
+            # current question as its own most relevant historical memory.
             preview = await asyncio.to_thread(
                 state.pipeline.build_preview, conversation.id, request.message
             )
             payload_messages = [{"role": "user", "content": request.message}]
             if preview.pruned_context:
+                # Retrieved memory is a system message, never a fabricated user turn.
                 payload_messages.insert(0, _context_system_message(preview))
             context_data = _context_json(preview, "middleware")
             await asyncio.to_thread(
@@ -361,7 +387,9 @@ async def ui_chat(request: UIChatRequest) -> StreamingResponse:
                 "recent_messages": [],
             }
     else:
-        current_messages = [*prior_messages]
+        # Direct mode is the comparison baseline: it sends every UI message and
+        # intentionally bypasses retrieval, pruning, and the RAG turn store.
+        current_messages = [*prior_messages]  # Copy before appending the unsaved prompt.
         current_messages.append(
             ConversationMessage(
                 id=0,
@@ -482,9 +510,14 @@ async def reset() -> dict[str, bool]:
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Upstream forwarding and streaming
+# ---------------------------------------------------------------------------
+
 async def _forward_ollama(path: str, payload: dict[str, Any]) -> Any:
     state: AppState = app.state.middle_layer
     payload.pop("_context_pruning_error", None)
+    # conversation_id belongs to this middleware and is not an Ollama option.
     payload.pop("conversation_id", None)
     options = payload.get("options")
     if isinstance(options, dict):
@@ -526,6 +559,8 @@ async def _ui_chat_stream(
     payload: dict[str, Any],
     context_data: dict[str, Any],
 ):
+    # Metadata is sent first so the UI can display the exact context while the
+    # assistant response is still streaming.
     yield _ndjson(
         {
             "type": "meta",
@@ -533,7 +568,7 @@ async def _ui_chat_stream(
             "context": context_data,
         }
     )
-    assistant_text = ""
+    assistant_text = ""  # Full response accumulated from incremental token events.
     url = f"{state.settings.llm_ollama_host}/api/chat"
     try:
         async with state.http_client.stream("POST", url, json=payload) as response:
@@ -549,13 +584,15 @@ async def _ui_chat_stream(
             async for line in response.aiter_lines():
                 if not line:
                     continue
-                data = json.loads(line)
+                data = json.loads(line)  # One Ollama JSON event per NDJSON line.
                 content = data.get("message", {}).get("content", "")
                 if content:
                     assistant_text += content
                     yield _ndjson({"type": "token", "content": content})
                 if data.get("done"):
                     if assistant_text:
+                        # Persist only completed responses. Aborted or failed
+                        # streams remain visible client-side but do not pollute RAG.
                         await asyncio.to_thread(
                             state.conversation_store.add_message,
                             conversation_id,
@@ -586,6 +623,10 @@ async def _ui_chat_stream(
     except (httpx.HTTPError, json.JSONDecodeError) as exc:
         yield _ndjson({"type": "error", "message": str(exc)})
 
+
+# ---------------------------------------------------------------------------
+# Serialization and payload helpers
+# ---------------------------------------------------------------------------
 
 def _payload(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(exclude_none=True)
@@ -648,6 +689,9 @@ def _context_json(preview: ContextPreview, mode: str) -> dict[str, Any]:
 def _split_chat_history(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Separate the active user prompt from history supplied by API clients."""
+    # The last user message is the active request; trailing assistant/tool
+    # messages, if supplied by a client, remain part of prior history.
     current_index = next(
         (
             index

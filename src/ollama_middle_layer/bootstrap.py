@@ -14,6 +14,8 @@ class OllamaBootstrapError(RuntimeError):
     pass
 
 
+# A server may already exist at the configured address. `owned` prevents this
+# application from terminating Ollama processes that it did not start.
 @dataclass
 class ManagedServer:
     host_url: str
@@ -38,10 +40,12 @@ def is_tcp_reachable(host_url: str, timeout: float = 0.25) -> bool:
 
 
 class OllamaServerManager:
+    """Starts and stops only the local Ollama processes owned by this app."""
+
     def __init__(self, models_dir: Path, binary: str = "ollama") -> None:
         self.models_dir = models_dir
         self.binary = binary
-        self.servers: list[ManagedServer] = []
+        self.servers: list[ManagedServer] = []  # Includes owned and reused servers.
 
     def start(self, host_url: str, timeout_seconds: float = 30.0) -> ManagedServer:
         if is_tcp_reachable(host_url):
@@ -57,6 +61,8 @@ class OllamaServerManager:
 
         host, port = _host_port(host_url)
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        # Each server receives its own listen address but shares one model
+        # directory, avoiding duplicate model downloads for LLM and embeddings.
         env = os.environ.copy()
         env["OLLAMA_HOST"] = f"{host}:{port}"
         env["OLLAMA_MODELS"] = str(self.models_dir)
@@ -70,7 +76,9 @@ class OllamaServerManager:
         server = ManagedServer(host_url=host_url, process=process, owned=True)
         self.servers.append(server)
 
-        deadline = time.monotonic() + timeout_seconds
+        # TCP readiness is used instead of a fixed sleep because startup time
+        # varies significantly between machines.
+        deadline = time.monotonic() + timeout_seconds  # Immune to wall-clock changes.
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise OllamaBootstrapError(f"Ollama server exited early for {host_url}.")
@@ -92,6 +100,7 @@ class OllamaServerManager:
 
 
 def _model_names(list_response: object) -> set[str]:
+    """Normalize object-style and dictionary-style Ollama SDK responses."""
     names: set[str] = set()
     models = getattr(list_response, "models", None)
     if models is None and isinstance(list_response, dict):

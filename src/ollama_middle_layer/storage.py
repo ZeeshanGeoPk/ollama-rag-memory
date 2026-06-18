@@ -10,6 +10,10 @@ from uuid import uuid4
 from .pruning import chunk_text, content_hash
 
 
+# ---------------------------------------------------------------------------
+# Persistence records
+# ---------------------------------------------------------------------------
+
 @dataclass(frozen=True)
 class Turn:
     id: int
@@ -22,8 +26,8 @@ class Turn:
 @dataclass(frozen=True)
 class RetrievedChunk:
     text: str
-    distance: float
-    metadata: dict[str, Any]
+    distance: float  # Chroma cosine distance; lower values are more similar.
+    metadata: dict[str, Any]  # Carries turn id, role, and ordered chunk index.
 
 
 @dataclass(frozen=True)
@@ -46,7 +50,13 @@ class ConversationMessage:
     created_at: float
 
 
+# ---------------------------------------------------------------------------
+# RAG source-of-truth history
+# ---------------------------------------------------------------------------
+
 class TurnStore:
+    """Stores every middleware turn before it is chunked for vector search."""
+
     def __init__(self, sqlite_path: Path) -> None:
         sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         self.sqlite_path = sqlite_path
@@ -92,6 +102,8 @@ class TurnStore:
                 """,
                 (conversation_id, limit),
             ).fetchall()
+        # SQL selects newest-first for LIMIT efficiency; callers expect normal
+        # conversational order.
         return [
             Turn(id=row[0], conversation_id=row[1], role=row[2], content=row[3], created_at=row[4])
             for row in reversed(rows)
@@ -137,6 +149,12 @@ class TurnStore:
 
 
 class ConversationStore:
+    """Stores browser UI conversations independently from the RAG index.
+
+    The separation allows the UI to compare direct Ollama mode with middleware
+    mode without indexing direct-mode messages into semantic memory.
+    """
+
     def __init__(self, sqlite_path: Path) -> None:
         sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         self.sqlite_path = sqlite_path
@@ -194,6 +212,8 @@ class ConversationStore:
 
     def list(self) -> list[Conversation]:
         with self._connect() as conn:
+            # The correlated subquery returns the latest message as the sidebar
+            # preview while COUNT supplies conversation metadata in one query.
             rows = conn.execute(
                 """
                 SELECT
@@ -331,6 +351,8 @@ class ConversationStore:
 
 
 class ChromaContextStore:
+    """Persistent semantic index derived from the complete SQLite turn history."""
+
     def __init__(self, chroma_dir: Path, embedding_service: Any) -> None:
         try:
             import chromadb
@@ -339,6 +361,7 @@ class ChromaContextStore:
         chroma_dir.mkdir(parents=True, exist_ok=True)
         self.embedding_service = embedding_service
         self.client = chromadb.PersistentClient(path=str(chroma_dir))
+        # Version the collection name when stored metadata/schema changes.
         self.collection_name = "conversation_context_v3"
         self.collection = self.client.get_or_create_collection(
             name=self.collection_name,
@@ -346,10 +369,14 @@ class ChromaContextStore:
         )
 
     def add_turn(self, conversation_id: str, turn_id: int, role: str, content: str) -> None:
+        # Ordered chunk metadata lets retrieval expand a hit to neighboring text
+        # and reconstruct its original conversation exchange.
         chunks = chunk_text(content)
         if not chunks:
             return
         embeddings = self.embedding_service.embed_documents(chunks)
+        # Deterministic ids make retries idempotent because `upsert` replaces the
+        # same conversation/turn/chunk record instead of creating duplicates.
         ids = [f"{conversation_id}:{turn_id}:{index}" for index in range(len(chunks))]
         metadatas = [
             {
@@ -370,12 +397,15 @@ class ChromaContextStore:
 
     def query(self, conversation_id: str, query_text: str, top_k: int) -> list[RetrievedChunk]:
         embedding = self.embedding_service.embed_query(query_text)
+        # Conversation filtering is essential: semantic similarity must never
+        # leak memories between otherwise unrelated chats.
         result = self.collection.query(
             query_embeddings=[embedding],
             n_results=top_k,
             where={"conversation_id": conversation_id},
             include=["documents", "distances", "metadatas"],
         )
+        # Chroma returns one nested result list per supplied query embedding.
         docs = result.get("documents", [[]])[0]
         distances = result.get("distances", [[]])[0]
         metadatas = result.get("metadatas", [[]])[0]
@@ -396,6 +426,7 @@ class ChromaContextStore:
         self.collection.delete(where={"conversation_id": conversation_id})
 
     def reindex_if_empty(self, turns: list[Turn]) -> None:
+        """Rebuild a missing Chroma collection from authoritative SQLite turns."""
         if self.collection.count() or not turns:
             return
         for turn in turns:
@@ -408,6 +439,8 @@ class ChromaContextStore:
 
 
 def conversation_id_from_payload(payload: dict[str, Any], default: str = "default") -> str:
+    # Some Ollama clients preserve custom data only inside `options`, so both
+    # placements are accepted. The nested value takes precedence.
     options = payload.get("options")
     if isinstance(options, dict) and options.get("conversation_id"):
         return str(options["conversation_id"])
