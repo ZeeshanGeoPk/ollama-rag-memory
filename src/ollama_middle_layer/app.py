@@ -2,24 +2,40 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import asyncio
-from typing import Any
+import json
+from pathlib import Path
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from .bootstrap import OllamaBootstrapError, OllamaServerManager, ensure_model
 from .config import Settings
-from .context_pipeline import ContextPipeline
+from .context_pipeline import ContextPipeline, ContextPreview
+from .gpu import read_gpu_stats
 from .ollama_clients import EmbeddingService, create_ollama_clients
-from .storage import ChromaContextStore, TurnStore, conversation_id_from_payload
+from .pruning import estimate_tokens
+from .storage import (
+    ChromaContextStore,
+    Conversation,
+    ConversationMessage,
+    ConversationStore,
+    TurnStore,
+    conversation_id_from_payload,
+)
+
+
+WEB_DIR = Path(__file__).parent / "web"
 
 
 class AppState:
     settings: Settings
     manager: OllamaServerManager | None
     pipeline: ContextPipeline
+    conversation_store: ConversationStore
     http_client: httpx.AsyncClient
 
 
@@ -76,6 +92,20 @@ class OllamaEmbeddingsRequest(BaseModel):
     prompt: str = Field(..., examples=["Context pruning middleware for local Ollama models."])
 
 
+class UIConversationCreate(BaseModel):
+    title: str = Field(default="New chat", max_length=120)
+
+
+class UIConversationUpdate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
+
+
+class UIChatRequest(BaseModel):
+    conversation_id: str | None = None
+    message: str = Field(..., min_length=1)
+    mode: Literal["middleware", "ollama"] = "middleware"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = Settings.load()
@@ -96,10 +126,12 @@ async def lifespan(app: FastAPI):
 
     embedding_service = EmbeddingService(clients.embed, settings.embed_model)
     turn_store = TurnStore(settings.sqlite_path)
+    conversation_store = ConversationStore(settings.sqlite_path)
     chroma_store = ChromaContextStore(settings.chroma_dir, embedding_service)
     app.state.middle_layer = AppState()
     app.state.middle_layer.settings = settings
     app.state.middle_layer.manager = manager
+    app.state.middle_layer.conversation_store = conversation_store
     app.state.middle_layer.pipeline = ContextPipeline(
         settings=settings,
         turn_store=turn_store,
@@ -116,6 +148,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Ollama Context-Pruning Middleware", lifespan=lifespan)
+
+
+@app.get("/", include_in_schema=False)
+async def web_ui() -> FileResponse:
+    return FileResponse(WEB_DIR / "index.html")
 
 
 @app.get("/health")
@@ -193,6 +230,207 @@ async def embeddings(request: OllamaEmbeddingsRequest) -> Any:
     return await _forward_embedding("/api/embeddings", payload)
 
 
+@app.get("/ui/api/conversations")
+async def list_conversations() -> list[dict[str, Any]]:
+    state: AppState = app.state.middle_layer
+    conversations = await asyncio.to_thread(state.conversation_store.list)
+    return [_conversation_json(conversation) for conversation in conversations]
+
+
+@app.post("/ui/api/conversations")
+async def create_conversation(request: UIConversationCreate) -> dict[str, Any]:
+    state: AppState = app.state.middle_layer
+    conversation = await asyncio.to_thread(
+        state.conversation_store.create, request.title.strip() or "New chat"
+    )
+    return _conversation_json(conversation)
+
+
+@app.get("/ui/api/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str) -> dict[str, Any]:
+    state: AppState = app.state.middle_layer
+    conversation = await asyncio.to_thread(state.conversation_store.get, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    messages = await asyncio.to_thread(state.conversation_store.messages, conversation_id)
+    return {
+        **_conversation_json(conversation),
+        "messages": [_message_json(message) for message in messages],
+    }
+
+
+@app.patch("/ui/api/conversations/{conversation_id}")
+async def update_conversation(
+    conversation_id: str,
+    request: UIConversationUpdate,
+) -> dict[str, Any]:
+    state: AppState = app.state.middle_layer
+    if await asyncio.to_thread(state.conversation_store.get, conversation_id) is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    await asyncio.to_thread(
+        state.conversation_store.set_title,
+        conversation_id,
+        request.title.strip(),
+    )
+    conversation = await asyncio.to_thread(state.conversation_store.get, conversation_id)
+    return _conversation_json(conversation)
+
+
+@app.delete("/ui/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str) -> dict[str, bool]:
+    state: AppState = app.state.middle_layer
+    await asyncio.to_thread(state.conversation_store.delete, conversation_id)
+    try:
+        await asyncio.to_thread(state.pipeline.delete_conversation, conversation_id)
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@app.post("/ui/api/chat")
+async def ui_chat(request: UIChatRequest) -> StreamingResponse:
+    state: AppState = app.state.middle_layer
+    conversation = None
+    if request.conversation_id:
+        conversation = await asyncio.to_thread(
+            state.conversation_store.get, request.conversation_id
+        )
+        if conversation is None:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+    else:
+        conversation = await asyncio.to_thread(
+            state.conversation_store.create, _conversation_title(request.message)
+        )
+
+    prior_messages = await asyncio.to_thread(
+        state.conversation_store.messages, conversation.id
+    )
+    if not prior_messages and conversation.title == "New chat":
+        await asyncio.to_thread(
+            state.conversation_store.set_title,
+            conversation.id,
+            _conversation_title(request.message),
+        )
+
+    await asyncio.to_thread(
+        state.conversation_store.add_message,
+        conversation.id,
+        "user",
+        request.message,
+        request.mode,
+    )
+
+    context_data: dict[str, Any]
+    if request.mode == "middleware":
+        try:
+            preview = await asyncio.to_thread(
+                state.pipeline.build_preview, conversation.id, request.message
+            )
+            payload_messages = [{"role": "user", "content": request.message}]
+            if preview.pruned_context:
+                payload_messages.insert(0, _context_system_message(preview))
+            context_data = _context_json(preview, "middleware")
+            await asyncio.to_thread(
+                state.pipeline.ingest_messages,
+                conversation.id,
+                [{"role": "user", "content": request.message}],
+            )
+        except Exception as exc:
+            payload_messages = [{"role": "user", "content": request.message}]
+            context_data = {
+                "mode": "middleware",
+                "error": str(exc),
+                "estimated_tokens": estimate_tokens(request.message),
+                "pruned_context": "",
+                "retrieved_chunks": [],
+                "recent_messages": [],
+            }
+    else:
+        current_messages = [*prior_messages]
+        current_messages.append(
+            ConversationMessage(
+                id=0,
+                conversation_id=conversation.id,
+                role="user",
+                content=request.message,
+                mode="ollama",
+                created_at=0,
+            )
+        )
+        payload_messages = [
+            {"role": message.role, "content": message.content}
+            for message in current_messages
+        ]
+        full_context = "\n".join(
+            f"{message['role']}: {message['content']}" for message in payload_messages
+        )
+        context_data = {
+            "mode": "ollama",
+            "estimated_tokens": estimate_tokens(full_context),
+            "pruned_context": full_context,
+            "retrieved_chunks": [],
+            "recent_messages": payload_messages,
+        }
+
+    payload = {
+        "model": state.settings.llm_model,
+        "messages": payload_messages,
+        "stream": True,
+    }
+    return StreamingResponse(
+        _ui_chat_stream(
+            state=state,
+            conversation_id=conversation.id,
+            mode=request.mode,
+            payload=payload,
+            context_data=context_data,
+        ),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.get("/ui/api/conversations/{conversation_id}/context")
+async def conversation_context(conversation_id: str) -> dict[str, Any]:
+    state: AppState = app.state.middle_layer
+    messages = await asyncio.to_thread(state.conversation_store.messages, conversation_id)
+    if not messages:
+        return {
+            "mode": "middleware",
+            "estimated_tokens": 0,
+            "pruned_context": "",
+            "retrieved_chunks": [],
+            "recent_messages": [],
+        }
+    latest_user = next(
+        (message for message in reversed(messages) if message.role == "user"),
+        messages[-1],
+    )
+    if latest_user.mode == "ollama":
+        content = "\n".join(f"{message.role}: {message.content}" for message in messages)
+        return {
+            "mode": "ollama",
+            "estimated_tokens": estimate_tokens(content),
+            "pruned_context": content,
+            "retrieved_chunks": [],
+            "recent_messages": [
+                {"role": message.role, "content": message.content}
+                for message in messages
+            ],
+        }
+    try:
+        preview = await asyncio.to_thread(
+            state.pipeline.build_preview, conversation_id, latest_user.content
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return _context_json(preview, "middleware")
+
+
+@app.get("/ui/api/gpu")
+async def gpu_stats() -> dict[str, Any]:
+    return await asyncio.to_thread(read_gpu_stats)
+
+
 @app.get("/debug/context-preview")
 async def context_preview(conversation_id: str, q: str) -> dict[str, Any]:
     state: AppState = app.state.middle_layer
@@ -214,6 +452,7 @@ async def context_preview(conversation_id: str, q: str) -> dict[str, Any]:
 async def reset() -> dict[str, bool]:
     state: AppState = app.state.middle_layer
     await asyncio.to_thread(state.pipeline.clear)
+    await asyncio.to_thread(state.conversation_store.clear)
     return {"ok": True}
 
 
@@ -250,5 +489,128 @@ async def _stream_ollama(url: str, payload: dict[str, Any]):
             yield chunk
 
 
+async def _ui_chat_stream(
+    state: AppState,
+    conversation_id: str,
+    mode: str,
+    payload: dict[str, Any],
+    context_data: dict[str, Any],
+):
+    yield _ndjson(
+        {
+            "type": "meta",
+            "conversation_id": conversation_id,
+            "context": context_data,
+        }
+    )
+    assistant_text = ""
+    url = f"{state.settings.llm_ollama_host}/api/chat"
+    try:
+        async with state.http_client.stream("POST", url, json=payload) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                yield _ndjson(
+                    {
+                        "type": "error",
+                        "message": body.decode("utf-8", errors="replace"),
+                    }
+                )
+                return
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                data = json.loads(line)
+                content = data.get("message", {}).get("content", "")
+                if content:
+                    assistant_text += content
+                    yield _ndjson({"type": "token", "content": content})
+                if data.get("done"):
+                    if assistant_text:
+                        await asyncio.to_thread(
+                            state.conversation_store.add_message,
+                            conversation_id,
+                            "assistant",
+                            assistant_text,
+                            mode,
+                        )
+                        if mode == "middleware":
+                            await asyncio.to_thread(
+                                state.pipeline.ingest_messages,
+                                conversation_id,
+                                [{"role": "assistant", "content": assistant_text}],
+                            )
+                    yield _ndjson(
+                        {
+                            "type": "done",
+                            "conversation_id": conversation_id,
+                            "context": context_data,
+                            "metrics": {
+                                "total_duration": data.get("total_duration"),
+                                "load_duration": data.get("load_duration"),
+                                "prompt_eval_count": data.get("prompt_eval_count"),
+                                "eval_count": data.get("eval_count"),
+                                "eval_duration": data.get("eval_duration"),
+                            },
+                        }
+                    )
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        yield _ndjson({"type": "error", "message": str(exc)})
+
+
 def _payload(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(exclude_none=True)
+
+
+def _ndjson(data: dict[str, Any]) -> bytes:
+    return (json.dumps(data, ensure_ascii=True) + "\n").encode("utf-8")
+
+
+def _conversation_title(message: str) -> str:
+    clean = " ".join(message.split())
+    return clean[:52] + ("..." if len(clean) > 52 else "")
+
+
+def _conversation_json(conversation: Conversation) -> dict[str, Any]:
+    return {
+        "id": conversation.id,
+        "title": conversation.title,
+        "created_at": conversation.created_at,
+        "updated_at": conversation.updated_at,
+        "message_count": conversation.message_count,
+        "preview": conversation.preview,
+    }
+
+
+def _message_json(message: ConversationMessage) -> dict[str, Any]:
+    return {
+        "id": message.id,
+        "conversation_id": message.conversation_id,
+        "role": message.role,
+        "content": message.content,
+        "mode": message.mode,
+        "created_at": message.created_at,
+    }
+
+
+def _context_system_message(preview: ContextPreview) -> dict[str, str]:
+    return {
+        "role": "system",
+        "content": (
+            "Use this locally retrieved and pruned context only when relevant. "
+            "It may contain older conversation details.\n\n"
+            f"{preview.pruned_context}"
+        ),
+    }
+
+
+def _context_json(preview: ContextPreview, mode: str) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "estimated_tokens": preview.estimated_tokens,
+        "pruned_context": preview.pruned_context,
+        "retrieved_chunks": preview.retrieved_chunks,
+        "recent_messages": preview.recent_messages,
+    }
+
+
+app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")

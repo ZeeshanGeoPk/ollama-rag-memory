@@ -146,6 +146,10 @@ class ContextPipeline:
         self.turn_store.clear()
         self.chroma_store.clear()
 
+    def delete_conversation(self, conversation_id: str) -> None:
+        self.turn_store.delete_conversation(conversation_id)
+        self.chroma_store.delete_conversation(conversation_id)
+
 
 def _latest_user_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):

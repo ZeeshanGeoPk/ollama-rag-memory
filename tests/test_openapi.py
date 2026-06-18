@@ -18,3 +18,11 @@ def test_chat_schema_includes_messages_and_conversation_id() -> None:
 
     assert "messages" in chat_schema["properties"]
     assert "conversation_id" in chat_schema["properties"]
+
+
+def test_web_ui_routes_are_registered() -> None:
+    schema = app.openapi()
+
+    assert "/ui/api/chat" in schema["paths"]
+    assert "/ui/api/conversations" in schema["paths"]
+    assert "/ui/api/gpu" in schema["paths"]

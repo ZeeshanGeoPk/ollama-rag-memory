@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Context Console</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand-row">
+        <div class="brand-mark">LC</div>
+        <div>
+          <strong>Local Context</strong>
+          <span>Ollama workspace</span>
+        </div>
+      </div>
+
+      <button class="new-chat-button" id="new-chat" type="button">
+        <span aria-hidden="true">+</span>
+        New conversation
+      </button>
+
+      <div class="sidebar-label">Conversations</div>
+      <nav class="conversation-list" id="conversation-list" aria-label="Conversation history"></nav>
+    </aside>
+
+    <main class="chat-workspace">
+      <header class="topbar">
+        <button class="icon-button mobile-only" id="sidebar-toggle" type="button" title="Open conversations" aria-label="Open conversations">☰</button>
+        <div class="conversation-heading">
+          <strong id="conversation-title">New conversation</strong>
+          <span id="connection-status">Ready</span>
+        </div>
+
+        <div class="mode-control" role="group" aria-label="Chat mode">
+          <button class="mode-option active" data-mode="middleware" type="button">Middle layer</button>
+          <button class="mode-option" data-mode="ollama" type="button">Direct Ollama</button>
+        </div>
+
+        <div class="gpu-compact" id="gpu-compact" title="Live GPU usage">
+          <span class="status-dot"></span>
+          <span id="gpu-compact-text">GPU checking</span>
+        </div>
+        <button class="icon-button mobile-only" id="context-toggle" type="button" title="Open context window" aria-label="Open context window">◫</button>
+      </header>
+
+      <section class="message-area" id="message-area" aria-live="polite">
+        <div class="empty-state" id="empty-state">
+          <div class="empty-mark">LC</div>
+          <h1>Start a local conversation</h1>
+          <p>Choose whether each reply uses direct Ollama history or the pruned context pipeline.</p>
+        </div>
+      </section>
+
+      <footer class="composer-wrap">
+        <form class="composer" id="chat-form">
+          <textarea id="message-input" rows="1" placeholder="Message phi4-mini..." aria-label="Message"></textarea>
+          <button class="send-button" id="send-button" type="submit" title="Send message" aria-label="Send message">↑</button>
+        </form>
+        <div class="composer-meta">
+          <span id="mode-hint">Pruned retrieval enabled</span>
+          <span>Enter to send · Shift+Enter for new line</span>
+        </div>
+      </footer>
+    </main>
+
+    <aside class="context-panel" id="context-panel">
+      <div class="panel-header">
+        <div>
+          <strong>Context window</strong>
+          <span id="context-mode">Middle layer</span>
+        </div>
+        <button class="icon-button mobile-only" id="context-close" type="button" title="Close context window" aria-label="Close context window">×</button>
+      </div>
+
+      <section class="context-stats">
+        <div>
+          <span>Estimated tokens</span>
+          <strong id="context-tokens">0</strong>
+        </div>
+        <div>
+          <span>Retrieved chunks</span>
+          <strong id="context-chunks">0</strong>
+        </div>
+      </section>
+
+      <div class="panel-section">
+        <div class="section-heading">
+          <strong>Forwarded context</strong>
+          <button class="text-button" id="copy-context" type="button">Copy</button>
+        </div>
+        <pre class="context-content" id="context-content">No context has been sent yet.</pre>
+      </div>
+
+      <div class="panel-section gpu-section">
+        <div class="section-heading">
+          <strong>GPU telemetry</strong>
+          <span class="live-label">LIVE</span>
+        </div>
+        <div id="gpu-details" class="gpu-details">
+          <p class="muted">Checking NVIDIA telemetry...</p>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="scrim" id="scrim"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

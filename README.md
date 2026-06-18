@@ -24,6 +24,16 @@ Run the middleware:
 .venv/bin/python -m ollama_middle_layer
 ```
 
+Open the chat interface:
+
+```text
+http://127.0.0.1:8080
+```
+
+The interface includes saved conversations, streaming replies, a direct
+Ollama/middle-layer comparison toggle, the forwarded context window, and live
+NVIDIA GPU telemetry when `nvidia-smi` is available.
+
 On startup it will:
 
 1. Start two `ollama serve` processes on ports `8000` and `8001` if they are not already reachable.
