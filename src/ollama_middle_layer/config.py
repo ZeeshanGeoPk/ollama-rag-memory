@@ -38,6 +38,8 @@ class Settings:
     sqlite_path: Path
     recent_turns_to_keep: int
     retrieval_top_k: int
+    retrieval_chunk_neighbors: int
+    retrieval_include_turn_pair: bool
     sentence_score_threshold: float
     max_context_tokens: int
     recent_context_tokens: int
@@ -63,6 +65,12 @@ class Settings:
             sqlite_path=(root / os.getenv("SQLITE_PATH", ".data/context.sqlite")).resolve(),
             recent_turns_to_keep=int(os.getenv("RECENT_TURNS_TO_KEEP", "6")),
             retrieval_top_k=int(os.getenv("RETRIEVAL_TOP_K", "20")),
+            retrieval_chunk_neighbors=max(
+                0, int(os.getenv("RETRIEVAL_CHUNK_NEIGHBORS", "1"))
+            ),
+            retrieval_include_turn_pair=_bool_env(
+                "RETRIEVAL_INCLUDE_TURN_PAIR", True
+            ),
             sentence_score_threshold=float(os.getenv("SENTENCE_SCORE_THRESHOLD", "0.75")),
             max_context_tokens=int(os.getenv("MAX_CONTEXT_TOKENS", "1200")),
             recent_context_tokens=int(os.getenv("RECENT_CONTEXT_TOKENS", "650")),

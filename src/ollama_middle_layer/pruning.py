@@ -54,7 +54,7 @@ def chunk_text(text: str, max_chars: int = 1400, overlap: int = 160) -> list[str
             current = candidate
             continue
         chunks.append(current)
-        tail = current[-overlap:].strip()
+        tail = current[-overlap:].strip() if overlap > 0 else ""
         current = f"{tail}\n{unit}".strip() if tail else unit
     if current:
         chunks.append(current)

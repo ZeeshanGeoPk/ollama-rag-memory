@@ -6,18 +6,16 @@ from typing import Any
 from .config import Settings
 from .ollama_clients import EmbeddingService
 from .pruning import (
+    chunk_text,
     compact_context,
     estimate_tokens,
-    is_near_duplicate,
     is_global_history_query,
     limit_items_by_budget,
-    normalized_sentence,
     prune_by_budget,
     relevance_score,
-    remove_filler_and_duplicates,
     split_sentences,
 )
-from .storage import ChromaContextStore, TurnStore
+from .storage import ChromaContextStore, RetrievedChunk, TurnStore
 
 
 @dataclass(frozen=True)
@@ -117,8 +115,10 @@ class ContextPipeline:
                 for chunk in retrieved
                 if int(chunk.metadata.get("turn_id", -1)) not in recent_ids
             ]
-            deduped = remove_filler_and_duplicates(raw_chunks)
-            pruned_chunks = self._semantic_sentence_prune(context_query, deduped)
+            pruned_chunks = self._expand_retrieved_history(
+                retrieved,
+                older_turns,
+            )
         context_sections = []
         recent: list[str] = []
         if recent_turns:
@@ -133,22 +133,12 @@ class ContextPipeline:
             if recent:
                 context_sections.append("RECENT_TURNS:\n" + "\n".join(recent))
         if pruned_chunks:
-            recent_sentences = [
-                sentence
-                for item in recent
-                for sentence in split_sentences(item)
-            ]
-            pruned_chunks = self._remove_cross_section_duplicates(
-                pruned_chunks,
-                recent_sentences,
-            )
-            pruned_chunks = limit_items_by_budget(
+            pruned_chunks = prune_by_budget(
                 pruned_chunks,
                 min(
                     self.settings.retrieved_context_tokens,
                     self.settings.max_context_tokens,
                 ),
-                separator="\n\n",
             )
             section_name = "HISTORY_OVERVIEW" if global_history else "RELEVANT_HISTORY"
             if pruned_chunks:
@@ -183,26 +173,110 @@ class ContextPipeline:
             reduction_percent=round(reduction, 1),
         )
 
-    def _semantic_sentence_prune(self, query: str, chunks: list[str]) -> list[str]:
-        if not chunks:
+    def _expand_retrieved_history(
+        self,
+        retrieved: list[RetrievedChunk],
+        older_turns: list[Any],
+    ) -> list[str]:
+        """Expand vector hits into coherent, ordered conversation exchanges."""
+        if not retrieved or not older_turns:
             return []
-        query_embedding = self.embedding_service.embed_query(query)
-        output: list[str] = []
-        seen_sentences: set[str] = set()
-        for chunk in chunks:
-            kept = self._prune_text(query, chunk, query_embedding)
-            unique = []
-            for sentence in kept:
-                normalized = normalized_sentence(sentence)
-                if not normalized or normalized in seen_sentences:
-                    continue
-                seen_sentences.add(normalized)
-                unique.append(sentence)
-            if unique:
-                output.append("\n".join(unique))
-            if len(seen_sentences) >= self.settings.max_retrieved_sentences:
-                break
-        return output
+
+        turns_by_id = {turn.id: turn for turn in older_turns}
+        turn_positions = {turn.id: index for index, turn in enumerate(older_turns)}
+        groups: dict[tuple[int, ...], dict[str, Any]] = {}
+
+        for rank, hit in enumerate(retrieved):
+            try:
+                turn_id = int(hit.metadata.get("turn_id", -1))
+                chunk_index = int(hit.metadata.get("chunk_index", 0))
+            except (TypeError, ValueError):
+                continue
+            turn = turns_by_id.get(turn_id)
+            if turn is None:
+                continue
+
+            group_turn_ids = [turn_id]
+            if self.settings.retrieval_include_turn_pair:
+                pair_id = self._paired_turn_id(turn_id, older_turns, turn_positions)
+                if pair_id is not None:
+                    group_turn_ids.append(pair_id)
+            group_key = tuple(sorted(group_turn_ids, key=turn_positions.__getitem__))
+            group = groups.setdefault(
+                group_key,
+                {
+                    "rank": rank,
+                    "chunk_indexes": {},
+                },
+            )
+            group["rank"] = min(group["rank"], rank)
+            group["chunk_indexes"].setdefault(turn_id, set()).add(chunk_index)
+
+        passages: list[tuple[int, str]] = []
+        for turn_ids, group in groups.items():
+            lines = [
+                (
+                    f"[MEMORY turns {turn_ids[0]}-{turn_ids[-1]}]"
+                    if len(turn_ids) > 1
+                    else f"[MEMORY turn {turn_ids[0]}]"
+                )
+            ]
+            for turn_id in turn_ids:
+                turn = turns_by_id[turn_id]
+                content = self._retrieved_turn_content(
+                    turn,
+                    group["chunk_indexes"].get(turn_id),
+                )
+                if content:
+                    lines.append(f"{_role_label(turn.role)} (turn {turn.id}): {content}")
+            if len(lines) > 1:
+                passages.append((group["rank"], "\n".join(lines)))
+
+        return [
+            passage
+            for _, passage in sorted(passages, key=lambda item: item[0])
+        ]
+
+    def _paired_turn_id(
+        self,
+        turn_id: int,
+        turns: list[Any],
+        positions: dict[int, int],
+    ) -> int | None:
+        index = positions[turn_id]
+        turn = turns[index]
+        if turn.role == "user" and index + 1 < len(turns):
+            candidate = turns[index + 1]
+            if candidate.role == "assistant":
+                return candidate.id
+        if turn.role == "assistant" and index > 0:
+            candidate = turns[index - 1]
+            if candidate.role == "user":
+                return candidate.id
+        return None
+
+    def _retrieved_turn_content(
+        self,
+        turn: Any,
+        matched_indexes: set[int] | None,
+    ) -> str:
+        if not matched_indexes:
+            return compact_context(turn.content)
+        chunks = chunk_text(turn.content)
+        if not chunks:
+            return ""
+        neighbor_count = self.settings.retrieval_chunk_neighbors
+        selected_indexes: set[int] = set()
+        for index in matched_indexes:
+            start = max(0, index - neighbor_count)
+            end = min(len(chunks), index + neighbor_count + 1)
+            selected_indexes.update(range(start, end))
+        selected = [
+            compact_context(chunks[index])
+            for index in sorted(selected_indexes)
+            if 0 <= index < len(chunks)
+        ]
+        return "\n".join(item for item in selected if item)
 
     def _prune_recent_turns(self, query: str, turns: list[Any]) -> list[str]:
         if not turns:
@@ -238,23 +312,6 @@ class ContextPipeline:
                 output.append(f"{role}: {' '.join(kept)}")
         return output
 
-    def _prune_text(
-        self,
-        query: str,
-        text: str,
-        query_embedding: list[float],
-    ) -> list[str]:
-        sentences = split_sentences(text)
-        if not sentences:
-            return []
-        sentence_embeddings = self.embedding_service.embed_documents(sentences)
-        return [
-            compact_context(sentence)
-            for sentence, embedding in zip(sentences, sentence_embeddings)
-            if relevance_score(query, sentence, query_embedding, embedding)
-            >= self.settings.sentence_score_threshold
-        ]
-
     def _ranked_sentences(
         self,
         query: str,
@@ -288,30 +345,6 @@ class ContextPipeline:
             for item in sorted(selected, key=lambda item: item[0])
             if item[2]
         ]
-
-    def _remove_cross_section_duplicates(
-        self,
-        chunks: list[str],
-        recent_sentences: list[str],
-    ) -> list[str]:
-        accepted = list(recent_sentences)
-        output: list[str] = []
-        sentence_count = 0
-        for chunk in chunks:
-            unique: list[str] = []
-            for sentence in split_sentences(chunk):
-                if any(is_near_duplicate(sentence, existing) for existing in accepted):
-                    continue
-                unique.append(sentence)
-                accepted.append(sentence)
-                sentence_count += 1
-                if sentence_count >= self.settings.max_retrieved_sentences:
-                    break
-            if unique:
-                output.append("\n".join(unique))
-            if sentence_count >= self.settings.max_retrieved_sentences:
-                break
-        return output
 
     def _context_query(self, current_text: str, recent_turns: list[Any]) -> str:
         previous_user = next(

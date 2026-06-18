@@ -6,7 +6,16 @@ Local FastAPI middleware that sits between Ollama-compatible clients and two loc
 - Embedding server: `http://localhost:8002`
 - Middleware API: `http://localhost:8000`
 
-It stores chat history locally, retrieves relevant history with ChromaDB, prunes noisy context, and forwards a smaller request to the LLM server.
+It stores the complete chat history locally, retrieves relevant history with
+ChromaDB and `nomic-embed-text`, expands matches to their neighboring chunks
+and user/assistant exchange, and forwards only that focused context to the LLM.
+
+History is never stored as one giant vector. Each turn is split into ordered,
+overlapping chunks with conversation, turn, role, and chunk-index metadata.
+The latest turns are kept directly while older details are recalled through
+RAG. `RETRIEVAL_CHUNK_NEIGHBORS` controls how much text around each vector hit
+is restored, and `RETRIEVAL_INCLUDE_TURN_PAIR` keeps the matching question and
+answer together.
 
 ## Setup
 
