@@ -2,9 +2,9 @@
 
 Local FastAPI middleware that sits between Ollama-compatible clients and two local Ollama servers:
 
-- LLM server: `http://localhost:8000`
-- Embedding server: `http://localhost:8001`
-- Middleware API: `http://localhost:8080`
+- LLM server: `http://localhost:8001`
+- Embedding server: `http://localhost:8002`
+- Middleware API: `http://localhost:8000`
 
 It stores chat history locally, retrieves relevant history with ChromaDB, prunes noisy context, and forwards a smaller request to the LLM server.
 
@@ -27,7 +27,7 @@ Run the middleware:
 Open the chat interface:
 
 ```text
-http://127.0.0.1:8080
+http://127.0.0.1:8000
 ```
 
 The interface includes saved conversations, streaming replies, a direct
@@ -36,10 +36,10 @@ NVIDIA GPU telemetry when `nvidia-smi` is available.
 
 On startup it will:
 
-1. Start two `ollama serve` processes on ports `8000` and `8001` if they are not already reachable.
+1. Start two `ollama serve` processes on ports `8001` and `8002` if they are not already reachable.
 2. Use `.data/ollama_models` as the local Ollama model folder.
 3. Pull `phi4-mini:3.8b` and `nomic-embed-text:v1.5` only when missing.
-4. Serve the proxy API on `http://127.0.0.1:8080`.
+4. Serve the proxy API on `http://127.0.0.1:8000`.
 
 ## Endpoints
 
@@ -52,4 +52,4 @@ On startup it will:
 - `GET /debug/context-preview`
 - `POST /admin/reset`
 
-Point an Ollama-compatible client at `http://localhost:8080`.
+Point an Ollama-compatible client at `http://localhost:8000`.

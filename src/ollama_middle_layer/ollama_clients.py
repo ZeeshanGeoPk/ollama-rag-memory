@@ -27,6 +27,18 @@ class EmbeddingService:
         self.model = model
 
     def embed_one(self, text: str) -> list[float]:
+        return self._embed_one(text)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed_one(f"search_query: {text}")
+
+    def embed_document(self, text: str) -> list[float]:
+        return self._embed_one(f"search_document: {text}")
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed_many([f"search_document: {text}" for text in texts])
+
+    def _embed_one(self, text: str) -> list[float]:
         response = self.client.embed(model=self.model, input=text)
         embeddings = getattr(response, "embeddings", None)
         if embeddings is None and isinstance(response, dict):
@@ -42,6 +54,9 @@ class EmbeddingService:
         raise RuntimeError("Ollama embedding response did not include embeddings.")
 
     def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return self._embed_many(texts)
+
+    def _embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
         response = self.client.embed(model=self.model, input=texts)
@@ -50,4 +65,4 @@ class EmbeddingService:
             embeddings = response.get("embeddings")
         if embeddings:
             return [list(item) for item in embeddings]
-        return [self.embed_one(text) for text in texts]
+        return [self._embed_one(text) for text in texts]

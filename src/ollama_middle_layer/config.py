@@ -40,6 +40,10 @@ class Settings:
     retrieval_top_k: int
     sentence_score_threshold: float
     max_context_tokens: int
+    recent_context_tokens: int
+    retrieved_context_tokens: int
+    max_recent_assistant_sentences: int
+    max_retrieved_sentences: int
     default_conversation_id: str
     ollama_bootstrap: bool
 
@@ -49,9 +53,9 @@ class Settings:
         _load_dotenv(root / ".env")
         return cls(
             middleware_host=os.getenv("MIDDLEWARE_HOST", "127.0.0.1"),
-            middleware_port=int(os.getenv("MIDDLEWARE_PORT", "8080")),
-            llm_ollama_host=os.getenv("LLM_OLLAMA_HOST", "http://localhost:8000"),
-            embed_ollama_host=os.getenv("EMBED_OLLAMA_HOST", "http://localhost:8001"),
+            middleware_port=int(os.getenv("MIDDLEWARE_PORT", "8000")),
+            llm_ollama_host=os.getenv("LLM_OLLAMA_HOST", "http://localhost:8001"),
+            embed_ollama_host=os.getenv("EMBED_OLLAMA_HOST", "http://localhost:8002"),
             llm_model=os.getenv("LLM_MODEL", "phi4-mini:3.8b"),
             embed_model=os.getenv("EMBED_MODEL", "nomic-embed-text:v1.5"),
             ollama_models_dir=(root / os.getenv("OLLAMA_MODELS_DIR", ".data/ollama_models")).resolve(),
@@ -60,7 +64,13 @@ class Settings:
             recent_turns_to_keep=int(os.getenv("RECENT_TURNS_TO_KEEP", "6")),
             retrieval_top_k=int(os.getenv("RETRIEVAL_TOP_K", "20")),
             sentence_score_threshold=float(os.getenv("SENTENCE_SCORE_THRESHOLD", "0.75")),
-            max_context_tokens=int(os.getenv("MAX_CONTEXT_TOKENS", "12000")),
+            max_context_tokens=int(os.getenv("MAX_CONTEXT_TOKENS", "1200")),
+            recent_context_tokens=int(os.getenv("RECENT_CONTEXT_TOKENS", "650")),
+            retrieved_context_tokens=int(os.getenv("RETRIEVED_CONTEXT_TOKENS", "450")),
+            max_recent_assistant_sentences=int(
+                os.getenv("MAX_RECENT_ASSISTANT_SENTENCES", "4")
+            ),
+            max_retrieved_sentences=int(os.getenv("MAX_RETRIEVED_SENTENCES", "8")),
             default_conversation_id=os.getenv("DEFAULT_CONVERSATION_ID", "default"),
             ollama_bootstrap=_bool_env("OLLAMA_BOOTSTRAP", True),
         )

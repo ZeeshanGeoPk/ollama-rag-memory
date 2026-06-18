@@ -503,8 +503,12 @@ button {
   padding: 15px 16px;
 }
 
-.context-stats div + div {
+.context-stats div:nth-child(even) {
   border-left: 1px solid var(--line);
+}
+
+.context-stats div:nth-child(n + 3) {
+  border-top: 1px solid var(--line);
 }
 
 .context-stats span,

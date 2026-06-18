@@ -128,6 +128,7 @@ async def lifespan(app: FastAPI):
     turn_store = TurnStore(settings.sqlite_path)
     conversation_store = ConversationStore(settings.sqlite_path)
     chroma_store = ChromaContextStore(settings.chroma_dir, embedding_service)
+    await asyncio.to_thread(chroma_store.reindex_if_empty, turn_store.every_turn())
     app.state.middle_layer = AppState()
     app.state.middle_layer.settings = settings
     app.state.middle_layer.manager = manager
@@ -185,11 +186,23 @@ async def chat(request: OllamaChatRequest) -> Any:
     original_messages = list(payload.get("messages") or [])
     try:
         if original_messages:
+            prior_messages, current_message = _split_chat_history(original_messages)
+            await asyncio.to_thread(
+                state.pipeline.sync_history,
+                conversation_id,
+                prior_messages,
+            )
             payload = await asyncio.to_thread(
                 state.pipeline.augment_chat_payload, conversation_id, payload
             )
-            await asyncio.to_thread(state.pipeline.ingest_messages, conversation_id, original_messages)
+            if current_message:
+                await asyncio.to_thread(
+                    state.pipeline.ingest_messages,
+                    conversation_id,
+                    [current_message],
+                )
     except Exception as exc:
+        payload = state.pipeline.fallback_chat_payload(payload)
         payload["_context_pruning_error"] = str(exc)
     return await _forward_ollama("/api/chat", payload)
 
@@ -341,6 +354,8 @@ async def ui_chat(request: UIChatRequest) -> StreamingResponse:
                 "mode": "middleware",
                 "error": str(exc),
                 "estimated_tokens": estimate_tokens(request.message),
+                "original_tokens": estimate_tokens(request.message),
+                "reduction_percent": 0.0,
                 "pruned_context": "",
                 "retrieved_chunks": [],
                 "recent_messages": [],
@@ -367,6 +382,8 @@ async def ui_chat(request: UIChatRequest) -> StreamingResponse:
         context_data = {
             "mode": "ollama",
             "estimated_tokens": estimate_tokens(full_context),
+            "original_tokens": estimate_tokens(full_context),
+            "reduction_percent": 0.0,
             "pruned_context": full_context,
             "retrieved_chunks": [],
             "recent_messages": payload_messages,
@@ -397,6 +414,8 @@ async def conversation_context(conversation_id: str) -> dict[str, Any]:
         return {
             "mode": "middleware",
             "estimated_tokens": 0,
+            "original_tokens": 0,
+            "reduction_percent": 0.0,
             "pruned_context": "",
             "retrieved_chunks": [],
             "recent_messages": [],
@@ -410,6 +429,8 @@ async def conversation_context(conversation_id: str) -> dict[str, Any]:
         return {
             "mode": "ollama",
             "estimated_tokens": estimate_tokens(content),
+            "original_tokens": estimate_tokens(content),
+            "reduction_percent": 0.0,
             "pruned_context": content,
             "retrieved_chunks": [],
             "recent_messages": [
@@ -419,7 +440,10 @@ async def conversation_context(conversation_id: str) -> dict[str, Any]:
         }
     try:
         preview = await asyncio.to_thread(
-            state.pipeline.build_preview, conversation_id, latest_user.content
+            state.pipeline.build_preview,
+            conversation_id,
+            latest_user.content,
+            True,
         )
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -445,6 +469,8 @@ async def context_preview(conversation_id: str, q: str) -> dict[str, Any]:
         "retrieved_chunks": preview.retrieved_chunks,
         "pruned_context": preview.pruned_context,
         "estimated_tokens": preview.estimated_tokens,
+        "original_tokens": preview.original_tokens,
+        "reduction_percent": preview.reduction_percent,
     }
 
 
@@ -459,6 +485,10 @@ async def reset() -> dict[str, bool]:
 async def _forward_ollama(path: str, payload: dict[str, Any]) -> Any:
     state: AppState = app.state.middle_layer
     payload.pop("_context_pruning_error", None)
+    payload.pop("conversation_id", None)
+    options = payload.get("options")
+    if isinstance(options, dict):
+        options.pop("conversation_id", None)
     url = f"{state.settings.llm_ollama_host}{path}"
     if payload.get("stream"):
         return StreamingResponse(
@@ -607,10 +637,32 @@ def _context_json(preview: ContextPreview, mode: str) -> dict[str, Any]:
     return {
         "mode": mode,
         "estimated_tokens": preview.estimated_tokens,
+        "original_tokens": preview.original_tokens,
+        "reduction_percent": preview.reduction_percent,
         "pruned_context": preview.pruned_context,
         "retrieved_chunks": preview.retrieved_chunks,
         "recent_messages": preview.recent_messages,
     }
+
+
+def _split_chat_history(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    current_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        len(messages) - 1,
+    )
+    current = messages[current_index] if messages else None
+    prior = [
+        message
+        for index, message in enumerate(messages)
+        if index != current_index and message.get("role") != "system"
+    ]
+    return prior, current
 
 
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")

@@ -52,7 +52,7 @@ def test_ui_stream_persists_completed_assistant_message(monkeypatch) -> None:
     store = FakeConversationStore()
     pipeline = FakePipeline()
     state = SimpleNamespace(
-        settings=SimpleNamespace(llm_ollama_host="http://localhost:8000"),
+        settings=SimpleNamespace(llm_ollama_host="http://localhost:8001"),
         http_client=FakeHttpClient(),
         conversation_store=store,
         pipeline=pipeline,

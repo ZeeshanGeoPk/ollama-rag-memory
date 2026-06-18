@@ -19,6 +19,8 @@ const elements = {
   modeHint: document.querySelector("#mode-hint"),
   contextMode: document.querySelector("#context-mode"),
   contextTokens: document.querySelector("#context-tokens"),
+  contextOriginalTokens: document.querySelector("#context-original-tokens"),
+  contextReduction: document.querySelector("#context-reduction"),
   contextChunks: document.querySelector("#context-chunks"),
   contextContent: document.querySelector("#context-content"),
   gpuCompact: document.querySelector("#gpu-compact"),
@@ -300,6 +302,8 @@ function renderContext(context) {
   if (!context) {
     elements.contextMode.textContent = state.mode === "middleware" ? "Middle layer" : "Direct Ollama";
     elements.contextTokens.textContent = "0";
+    elements.contextOriginalTokens.textContent = "0";
+    elements.contextReduction.textContent = "0%";
     elements.contextChunks.textContent = "0";
     elements.contextContent.textContent = "No context has been sent yet.";
     return;
@@ -307,6 +311,8 @@ function renderContext(context) {
   elements.contextMode.textContent =
     context.mode === "ollama" ? "Direct Ollama" : "Middle layer";
   elements.contextTokens.textContent = formatNumber(context.estimated_tokens || 0);
+  elements.contextOriginalTokens.textContent = formatNumber(context.original_tokens || 0);
+  elements.contextReduction.textContent = `${context.reduction_percent || 0}%`;
   elements.contextChunks.textContent = formatNumber(context.retrieved_chunks?.length || 0);
   elements.contextContent.textContent =
     context.pruned_context || context.error || "No additional context was needed.";

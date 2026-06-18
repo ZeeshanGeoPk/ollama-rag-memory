@@ -97,6 +97,36 @@ class TurnStore:
             for row in reversed(rows)
         ]
 
+    def all_turns(self, conversation_id: str) -> list[Turn]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, conversation_id, role, content, created_at
+                FROM turns
+                WHERE conversation_id = ?
+                ORDER BY id
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [
+            Turn(id=row[0], conversation_id=row[1], role=row[2], content=row[3], created_at=row[4])
+            for row in rows
+        ]
+
+    def every_turn(self) -> list[Turn]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, conversation_id, role, content, created_at
+                FROM turns
+                ORDER BY id
+                """
+            ).fetchall()
+        return [
+            Turn(id=row[0], conversation_id=row[1], role=row[2], content=row[3], created_at=row[4])
+            for row in rows
+        ]
+
     def clear(self) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM turns")
@@ -309,13 +339,17 @@ class ChromaContextStore:
         chroma_dir.mkdir(parents=True, exist_ok=True)
         self.embedding_service = embedding_service
         self.client = chromadb.PersistentClient(path=str(chroma_dir))
-        self.collection = self.client.get_or_create_collection(name="conversation_context")
+        self.collection_name = "conversation_context_v3"
+        self.collection = self.client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def add_turn(self, conversation_id: str, turn_id: int, role: str, content: str) -> None:
         chunks = chunk_text(content)
         if not chunks:
             return
-        embeddings = self.embedding_service.embed_many(chunks)
+        embeddings = self.embedding_service.embed_documents(chunks)
         ids = [f"{conversation_id}:{turn_id}:{index}" for index in range(len(chunks))]
         metadatas = [
             {
@@ -335,7 +369,7 @@ class ChromaContextStore:
         )
 
     def query(self, conversation_id: str, query_text: str, top_k: int) -> list[RetrievedChunk]:
-        embedding = self.embedding_service.embed_one(query_text)
+        embedding = self.embedding_service.embed_query(query_text)
         result = self.collection.query(
             query_embeddings=[embedding],
             n_results=top_k,
@@ -352,11 +386,25 @@ class ChromaContextStore:
         ]
 
     def clear(self) -> None:
-        self.client.delete_collection(name="conversation_context")
-        self.collection = self.client.get_or_create_collection(name="conversation_context")
+        self.client.delete_collection(name=self.collection_name)
+        self.collection = self.client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def delete_conversation(self, conversation_id: str) -> None:
         self.collection.delete(where={"conversation_id": conversation_id})
+
+    def reindex_if_empty(self, turns: list[Turn]) -> None:
+        if self.collection.count() or not turns:
+            return
+        for turn in turns:
+            self.add_turn(
+                turn.conversation_id,
+                turn.id,
+                turn.role,
+                turn.content,
+            )
 
 
 def conversation_id_from_payload(payload: dict[str, Any], default: str = "default") -> str:
