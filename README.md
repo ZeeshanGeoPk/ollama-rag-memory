@@ -1,189 +1,159 @@
-# Ollama Context-Pruning Middleware
+# Ollama RAG Memory
 
-A local semantic context-virtualization proxy for Ollama.
+Give local Ollama models access to long conversation history without sending
+the entire chat on every request.
 
-This project keeps complete conversation history on local storage, recalls the
-parts relevant to the current request, reconstructs coherent conversation
-exchanges around those matches, and forwards a much smaller context to a local
-LLM.
+Ollama RAG Memory is a local FastAPI proxy that stores complete conversations,
+finds history relevant to the current question, and forwards a smaller,
+coherent context to Ollama.
 
-It is designed for laptops and edge devices where sending a 32K or 128K
-transcript on every request can make local inference slow or exhaust available
-memory.
+![Ollama RAG Memory interface showing chat history, forwarded context, token reduction, and GPU telemetry](./ollama-rag-memory-demo.png)
 
-## Why this project exists
+## The problem
 
-Long context windows are useful, but their full cost is paid on every prompt:
+Large context windows can make local inference slow and memory-intensive.
+Sending the same 32K or 128K conversation repeatedly means Ollama must process
+many old tokens that may have nothing to do with the current request.
 
-- more prompt tokens to evaluate;
-- higher time-to-first-token;
-- greater RAM and VRAM pressure;
-- repeated processing of history unrelated to the current request.
+This project uses:
 
-This middleware treats the model context window as working memory and local
-storage as long-term memory. The complete history remains available, but only
-recent and relevant information is placed back into the model's active context.
+- **SQLite** to preserve the complete conversation;
+- **ChromaDB** to index ordered conversation chunks;
+- **nomic-embed-text** to find relevant older history;
+- **token budgets** to control how much context reaches the chat model.
 
-## Distinctive highlights
+The full history remains on your machine. Only recent and relevant information
+is sent back to the model.
 
-The individual ideas behind RAG and external memory are established. What makes
-this project distinctive is their packaging for local Ollama:
+## What makes it useful
 
-- **Drop-in Ollama-compatible proxy** — point compatible clients at the
-  middleware instead of changing application-level prompting code.
-- **Complete local history** — SQLite remains the source of truth; semantic
-  retrieval is an index over history, not a replacement for it.
-- **Coherent memory reconstruction** — a vector hit expands to neighboring
-  chunks and, optionally, its user/assistant turn pair. The model receives an
-  understandable exchange rather than disconnected matching sentences.
-- **Recent + relevant context** — recent conversation continuity and older
-  semantic memories have separate token budgets.
-- **Follow-up-aware retrieval** — requests such as “implement it” are combined
-  with the previous user request before embedding.
-- **Global-history detection** — requests asking for a recap of the whole chat
-  bypass top-k retrieval so unrelated portions are not silently omitted.
-- **Fully local stack** — Ollama, `nomic-embed-text`, ChromaDB, and SQLite run
-  without a hosted model or external memory service.
-- **Observable optimization** — the included UI shows forwarded context,
-  original versus forwarded token estimates, retrieved chunks, reduction
-  percentage, and optional NVIDIA GPU telemetry.
-- **Direct comparison mode** — switch between the middle layer and unpruned
-  Ollama history for the same conversation.
-- **Graceful fallback** — if vector retrieval fails, the proxy forwards a
-  bounded window of recent messages instead of failing the chat request.
+- **Ollama-compatible API** — use the middleware as the Ollama base URL.
+- **Fully local** — no hosted model or external memory service is required.
+- **Complete history** — the vector database is an index; SQLite remains the
+  source of truth.
+- **Coherent retrieval** — matching chunks expand to nearby chunks and their
+  user/assistant exchange instead of returning isolated sentences.
+- **Follow-up awareness** — short prompts such as “implement it” are combined
+  with the previous request for retrieval.
+- **Recent + relevant memory** — immediate conversation and older memories use
+  separate token budgets.
+- **Safe fallback** — if retrieval fails, a bounded recent-history window is
+  still forwarded.
+- **Visible results** — the UI shows the exact forwarded context, approximate
+  token reduction, retrieved chunks, and optional NVIDIA GPU telemetry.
+- **Comparison mode** — switch between RAG memory and direct full-history
+  Ollama requests.
 
 ## How it works
 
 ```text
-Ollama-compatible client / included web UI
-                    |
-                    v
-        FastAPI middleware :8000
-                    |
-        +-----------+------------+
-        |                        |
-        v                        v
- SQLite complete history    nomic-embed-text
-        |                    Ollama :8002
-        |                        |
-        +----------> ChromaDB <--+
-                         |
-              relevant chunk matches
-                         |
-            neighbor + turn-pair expansion
-                         |
-             recent/retrieved token budgets
-                         |
-                         v
-                 Chat Ollama :8001
+User or Ollama-compatible client
+              |
+              v
+     Ollama RAG Memory :8000
+              |
+       +------+------+
+       |             |
+       v             v
+ SQLite history   nomic-embed-text :8002
+       |             |
+       +--> ChromaDB <+
+              |
+       relevant chunk matches
+              |
+    neighboring chunks + turn pair
+              |
+      recent/retrieved budgets
+              |
+              v
+        Chat Ollama :8001
 ```
 
-For each middleware request:
+For each request:
 
-1. Complete turns are stored in SQLite.
+1. The complete user and assistant turns are stored locally.
 2. Long turns are split into ordered, overlapping chunks.
-3. Chunks are embedded with `search_document:` using
-   `nomic-embed-text:v1.5`.
-4. The current request is embedded with `search_query:`.
-5. ChromaDB retrieves matches only from the active conversation.
-6. Matching chunks are expanded to nearby chunks and their conversation pair.
-7. Recent turns are sentence-ranked while the latest user-led exchange is
-   protected.
-8. Both sections are packed into configurable token budgets and forwarded as
-   model context.
+3. Chunks are embedded and stored in ChromaDB with conversation and turn IDs.
+4. The new request is embedded as a search query.
+5. ChromaDB returns matches from that conversation only.
+6. Each match expands to neighboring chunks and, optionally, its complete
+   user/assistant exchange.
+7. Recent turns and retrieved memories are fitted into configurable budgets.
+8. The optimized context and current request are sent to the chat model.
 
-History is never embedded as one giant vector. Chunk order, turn IDs, roles,
-and conversation IDs are retained as metadata so matching text can be restored
-in its original conversational setting.
-
-## Technology
-
-- Python 3.12+
-- FastAPI and Uvicorn
-- Ollama
-- `phi4-mini:3.8b` by default
-- `nomic-embed-text:v1.5`
-- ChromaDB with cosine similarity
-- SQLite
-- Plain HTML, CSS, and JavaScript frontend
+History is not stored as one giant vector. Small ordered chunks produce better
+retrieval and allow the original conversation around a match to be restored.
 
 ## Quick start
 
-Install [Ollama](https://ollama.com/) first.
+### Requirements
+
+- Linux
+- Python 3.12 or newer
+- [Ollama](https://ollama.com/)
+
+### Install and run
 
 ```bash
-git clone YOUR_REPOSITORY_URL
-cd ollama_middle_layer
+git clone https://github.com/ZeeshanGeoPk/ollama-rag-memory.git
+cd ollama-rag-memory
 
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+source .venv/bin/activate
+pip install -e ".[dev]"
 cp .env.example .env
 
-.venv/bin/python -m ollama_middle_layer
+python main.py
 ```
 
-Then open:
+Open:
 
 ```text
 http://127.0.0.1:8000
 ```
 
-With `OLLAMA_BOOTSTRAP=true`, startup will:
+The first startup may take longer because Ollama downloads the configured chat
+and embedding models when they are missing.
 
-1. reuse Ollama servers already listening at the configured addresses;
-2. otherwise start chat and embedding Ollama processes;
-3. share the configured local model directory between both processes;
-4. pull the configured models only when they are missing;
-5. rebuild an empty Chroma index from SQLite history when necessary.
-
-You can also use the installed command:
+You can also launch the installed command:
 
 ```bash
-.venv/bin/ollama-middle-layer
+ollama-middle-layer
 ```
 
-## Suggested demo
+## Demo
 
-The included UI makes the retrieval behavior visible without additional tools:
+The easiest way to demonstrate retrieval is:
 
-1. Start a middleware conversation and establish a specific fact:
+1. Select **Middle layer**.
+2. Tell the model a specific decision:
 
    ```text
    We chose PostgreSQL because the project needs transactional migrations.
    ```
 
-2. Continue the conversation with several unrelated requests so that the
-   decision moves outside the recent-turn window.
-
-3. Ask:
+3. Send enough unrelated messages for that decision to move outside the recent
+   context window.
+4. Ask:
 
    ```text
    Which database did we choose, and why?
    ```
 
-4. Open the **Context window** panel and compare:
+5. Inspect the **Context window** panel. It shows the recalled history and
+   original versus forwarded token estimates.
+6. Switch to **Direct Ollama** to compare RAG memory with sending the complete
+   transcript.
 
-   - the retrieved historical chunk;
-   - the reconstructed user/assistant exchange;
-   - original versus forwarded token estimates;
-   - the reduction percentage.
+## Use it as an Ollama-compatible API
 
-5. Switch to **Direct Ollama** to show the same request with the complete
-   transcript forwarded instead of retrieved memory.
-
-For an open-source showcase, a short screen recording of this flow communicates
-the project more clearly than a synthetic performance claim.
-
-## Using it as an Ollama-compatible API
-
-Point an Ollama-compatible client to:
+Use this base URL:
 
 ```text
 http://127.0.0.1:8000
 ```
 
-Provide a stable `conversation_id` so retrieval remains isolated to the correct
-chat:
+Pass a stable `conversation_id` so each chat has isolated memory:
 
 ```bash
 curl http://127.0.0.1:8000/api/chat \
@@ -195,14 +165,13 @@ curl http://127.0.0.1:8000/api/chat \
     "messages": [
       {
         "role": "user",
-        "content": "What database did we choose earlier and why?"
+        "content": "Which database did we choose and why?"
       }
     ]
   }'
 ```
 
-For clients that only preserve custom values inside Ollama options, this is
-also supported:
+Clients may also place the ID inside `options`:
 
 ```json
 {
@@ -212,148 +181,115 @@ also supported:
 }
 ```
 
-API clients should resend their normal transcript on subsequent chat requests.
-The middleware synchronizes the unseen suffix and avoids re-embedding the
-matching stored prefix. The included web UI persists both user and completed
-assistant turns directly.
+Generic API clients should continue sending their normal transcript. The
+middleware detects the already-stored prefix and indexes only unseen turns.
+The included UI persists completed user and assistant turns automatically.
 
-## Inspecting forwarded context
+## Preview retrieved context
 
-Preview what the middleware would send without running a generation:
+Inspect the context without generating an answer:
 
 ```bash
 curl --get http://127.0.0.1:8000/debug/context-preview \
   --data-urlencode "conversation_id=demo-project" \
-  --data-urlencode "q=What database did we choose?"
+  --data-urlencode "q=Which database did we choose?"
 ```
 
-The response includes:
-
-- raw retrieved chunks;
-- compressed recent turns;
-- reconstructed historical memory;
-- approximate original and forwarded token counts;
-- estimated reduction percentage.
+The response includes raw vector matches, reconstructed memories, recent
+context, approximate token counts, and reduction percentage.
 
 ## Configuration
 
-Every setting is documented inline in [.env.example](.env.example). Important
-retrieval controls include:
+Copy `.env.example` to `.env`. Every variable is documented inline.
 
-| Variable | Purpose |
+The most useful tuning options are:
+
+| Variable | Effect |
 |---|---|
-| `RECENT_TURNS_TO_KEEP` | Turns handled as recent continuity instead of older vector memory. |
-| `RETRIEVAL_TOP_K` | Maximum vector matches requested from ChromaDB. |
-| `RETRIEVAL_CHUNK_NEIGHBORS` | Chunks restored before and after each vector match. |
+| `RECENT_TURNS_TO_KEEP` | Number of newest turns handled as immediate context. |
+| `RETRIEVAL_TOP_K` | Number of vector matches requested from ChromaDB. |
+| `RETRIEVAL_CHUNK_NEIGHBORS` | Number of chunks restored around a match. |
 | `RETRIEVAL_INCLUDE_TURN_PAIR` | Keeps matching questions and answers together. |
-| `SENTENCE_SCORE_THRESHOLD` | Relevance cutoff used while compressing recent turns. |
-| `MAX_CONTEXT_TOKENS` | Overall approximate budget for generated context. |
-| `RECENT_CONTEXT_TOKENS` | Budget reserved for recent conversation continuity. |
-| `RETRIEVED_CONTEXT_TOKENS` | Budget reserved for older retrieved memory. |
-| `OLLAMA_BOOTSTRAP` | Whether this app starts Ollama and pulls missing models. |
+| `SENTENCE_SCORE_THRESHOLD` | Controls recent-turn pruning aggressiveness. |
+| `MAX_CONTEXT_TOKENS` | Overall approximate forwarded-context budget. |
+| `RECENT_CONTEXT_TOKENS` | Budget for recent conversation. |
+| `RETRIEVED_CONTEXT_TOKENS` | Budget for older retrieved memory. |
+| `OLLAMA_BOOTSTRAP` | Starts Ollama and pulls missing models when enabled. |
 
-The token estimator intentionally uses a fast character approximation rather
-than loading a model-specific tokenizer.
+Token counts use a fast character-based estimate rather than a model-specific
+tokenizer.
 
-## API endpoints
+## Main API endpoints
 
-### Ollama-compatible
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/chat` | Ollama-compatible chat with RAG memory. |
+| `POST /api/generate` | Ollama-compatible text generation. |
+| `POST /api/embed` | Proxies the current Ollama embedding API. |
+| `POST /api/embeddings` | Proxies the legacy embedding API. |
+| `GET /api/tags` | Lists models from the chat Ollama server. |
+| `GET /health` | Shows configured services and models. |
+| `GET /debug/context-preview` | Shows retrieved and forwarded context. |
+| `POST /admin/reset` | Clears conversations and indexed memory. |
 
-- `POST /api/chat`
-- `POST /api/generate`
-- `POST /api/embed`
-- `POST /api/embeddings`
-- `GET /api/tags`
-
-### Middleware and UI
-
-- `GET /health`
-- `GET /debug/context-preview`
-- `POST /admin/reset`
-- `GET /ui/api/conversations`
-- `POST /ui/api/conversations`
-- `GET /ui/api/conversations/{conversation_id}`
-- `PATCH /ui/api/conversations/{conversation_id}`
-- `DELETE /ui/api/conversations/{conversation_id}`
-- `GET /ui/api/conversations/{conversation_id}/context`
-- `POST /ui/api/chat`
-- `GET /ui/api/gpu`
-
-Interactive OpenAPI documentation is available at:
+Interactive API documentation:
 
 ```text
 http://127.0.0.1:8000/docs
 ```
 
-## Project layout
+## Project structure
 
 ```text
 src/ollama_middle_layer/
-├── app.py               FastAPI proxy, UI API, and streaming
+├── app.py               FastAPI routes, proxying, UI API, and streaming
+├── context_pipeline.py  Retrieval, memory reconstruction, and token budgets
+├── storage.py           SQLite history and ChromaDB index
+├── pruning.py           Chunking, scoring, compaction, and token limits
+├── ollama_clients.py    Ollama clients and embedding prefixes
 ├── bootstrap.py         Local Ollama process and model management
-├── config.py            Environment-based settings
-├── context_pipeline.py  Retrieval, reconstruction, pruning, and budgets
-├── ollama_clients.py    Chat/embedding clients and retrieval prefixes
-├── pruning.py           Chunking, scoring, deduplication, and token limits
-├── storage.py           SQLite history and ChromaDB vector index
+├── config.py            Environment configuration
 ├── gpu.py               Optional NVIDIA telemetry
-└── web/                 Dependency-free browser interface
+└── web/                 Browser interface
 ```
 
-## Testing
+## Tests
 
 ```bash
-.venv/bin/pytest -q
+pytest -q
 ```
 
-The tests cover storage ordering, retrieval expansion, neighboring chunks,
-question/answer pairing, deduplication, context pruning helpers, API schemas,
-bootstrap behavior, GPU fallback, and streamed assistant persistence.
+Tests cover storage, chunk expansion, question/answer pairing, pruning,
+conversation isolation, API schemas, streaming persistence, bootstrap behavior,
+and GPU fallback.
 
 ## Current limitations
 
-- Token counts are approximations, not model-tokenizer-exact values.
-- Semantic recall depends on the embedding model, chunk boundaries, and chosen
-  retrieval budgets.
-- Global-history detection currently uses lightweight phrase patterns.
-- The proxy does not currently rerank Chroma results with a cross-encoder.
-- API assistant responses are learned from the transcript supplied on a later
-  request; the included UI persists completed assistant streams immediately.
-- The service has no authentication or TLS. Keep it bound to localhost unless
-  it is placed behind a secure reverse proxy.
-- GPU telemetry currently targets `nvidia-smi`; inference itself does not
-  require an NVIDIA GPU.
+- Token counts are approximate.
+- Retrieval quality depends on the embedding model, chunk boundaries, and
+  configured budgets.
+- Global-history questions are detected with lightweight text patterns.
+- Chroma results are not yet reranked with a cross-encoder.
+- The service has no authentication or TLS. Keep it on localhost unless it is
+  protected by a secure reverse proxy.
+- GPU telemetry uses `nvidia-smi`, although inference itself does not require
+  an NVIDIA GPU.
 
 ## Roadmap
 
-- Exact tokenizer-aware budgeting.
-- Optional cross-encoder reranking.
-- Configurable embedding chunk size and overlap.
-- Hybrid BM25 and vector retrieval.
-- Memory scoring based on recency, role, and retrieval frequency.
-- Import/export and conversation-level index repair.
-- Retrieval benchmarks for recall, latency, and prompt-token reduction.
-- Docker and system service deployment examples.
+- Hybrid keyword and vector retrieval.
+- Configurable chunk size and overlap.
+- Retrieval quality and latency benchmarks.
+- Docker and system service examples.
 
-## Positioning
+## License
 
-This is not intended to replace general-purpose agent-memory platforms such as
-Letta, Mem0, or Zep. It is a smaller and more transparent component:
+Licensed under the [Apache License 2.0](LICENSE).
 
-> A local semantic context-virtualization proxy that gives Ollama applications
-> access to long conversation history without forwarding the entire transcript
-> on every request.
-
-That narrow scope makes it useful for experiments, demonstrations, local chat
-applications, and resource-constrained machines where prompt processing is the
-bottleneck.
+Ollama models and downloaded model weights retain their own licenses.
 
 ## Contributing
 
-Issues and pull requests are welcome. Useful contributions include retrieval
-quality tests, additional embedding models, alternative vector stores,
-tokenizer integrations, deployment examples, and reproducible performance
-benchmarks.
-
-Before publishing the repository, add the open-source license you want to use
-as a top-level `LICENSE` file.
+Issues and pull requests are welcome, especially for retrieval benchmarks,
+additional embedding models, tokenizer support, alternative vector stores, and
+deployment examples.
